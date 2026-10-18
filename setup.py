@@ -1376,6 +1376,10 @@ if not _is_xpu() and sys.version_info >= (3, 11):
     ext_modules.append(CMakeExtension(name="vllm.spinloop"))
     ext_modules.append(CMakeExtension(name="vllm.fs_io_C"))
 
+mwf_extension = CMakeExtension(name="vllm._mwf_candidate_index")
+mwf_extension.py_limited_api = False
+ext_modules.append(mwf_extension)
+
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 

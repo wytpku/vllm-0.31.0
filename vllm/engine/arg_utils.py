@@ -77,6 +77,7 @@ from vllm.config.cache import (
     MambaCacheMode,
     MambaDType,
     PrefixCachingHashAlgo,
+    PrefixCacheEvictionPolicy,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import (
@@ -570,6 +571,11 @@ class EngineArgs:
     )
     block_size: int | None = None
     enable_prefix_caching: bool | None = None
+    prefix_cache_eviction_policy: PrefixCacheEvictionPolicy = (CacheConfig.prefix_cache_eviction_policy)
+    mwf_minexp_a: float = get_field(CacheConfig, "mwf_minexp_a")
+    mwf_minexp_b: float = get_field(CacheConfig, "mwf_minexp_b")
+    mwf_minexp_alpha: float = get_field(CacheConfig, "mwf_minexp_alpha")
+    mwf_minexp_beta: float = get_field(CacheConfig, "mwf_minexp_beta")
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -1341,6 +1347,18 @@ class EngineArgs:
                 **cache_kwargs["enable_prefix_caching"],
                 "default": None,
             },
+        )
+        cache_group.add_argument(
+            "--prefix-cache-eviction-policy",
+            **cache_kwargs["prefix_cache_eviction_policy"],
+        )
+        cache_group.add_argument("--mwf-minexp-a", **cache_kwargs["mwf_minexp_a"])
+        cache_group.add_argument("--mwf-minexp-b", **cache_kwargs["mwf_minexp_b"])
+        cache_group.add_argument(
+            "--mwf-minexp-alpha", **cache_kwargs["mwf_minexp_alpha"]
+        )
+        cache_group.add_argument(
+            "--mwf-minexp-beta", **cache_kwargs["mwf_minexp_beta"]
         )
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
@@ -2214,6 +2232,11 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
+            prefix_cache_eviction_policy=self.prefix_cache_eviction_policy,
+            mwf_minexp_a=self.mwf_minexp_a,
+            mwf_minexp_b=self.mwf_minexp_b,
+            mwf_minexp_alpha=self.mwf_minexp_alpha,
+            mwf_minexp_beta=self.mwf_minexp_beta,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,

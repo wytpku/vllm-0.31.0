@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import unittest
 from dataclasses import dataclass
 from enum import Enum
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.config.cache import CacheConfig
 from vllm.config.scheduler import SchedulerConfig
@@ -241,6 +243,76 @@ def test_scheduler_config_hash_includes_max_num_seqs():
 def test_cache_config_hash_ignores_prefix_cache_retention_interval():
     base_hash = CacheConfig().compute_hash()
     assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
+
+
+class TestMWFCacheConfig(unittest.TestCase):
+    """Validate MWF configuration before any blocks or native index exist."""
+
+    def test_defaults_preserve_lru_and_original_minexp_parameters(self):
+        config = CacheConfig()
+        self.assertEqual(config.prefix_cache_eviction_policy, "lru")
+        self.assertEqual(
+            (
+                config.mwf_minexp_a,
+                config.mwf_minexp_b,
+                config.mwf_minexp_alpha,
+                config.mwf_minexp_beta,
+            ),
+            (0.0, -19.15349, 1915.332, 47.63942),
+        )
+
+    def test_custom_mwf_parameters_allow_negative_offsets(self):
+        config = CacheConfig(
+            prefix_cache_eviction_policy="mwf",
+            mwf_minexp_a=-1.0,
+            mwf_minexp_b=-2.0,
+            mwf_minexp_alpha=3.0,
+            mwf_minexp_beta=4.0,
+        )
+        self.assertEqual(config.prefix_cache_eviction_policy, "mwf")
+        self.assertEqual(config.mwf_minexp_a, -1.0)
+        self.assertEqual(config.mwf_minexp_b, -2.0)
+        self.assertEqual(config.mwf_minexp_alpha, 3.0)
+        self.assertEqual(config.mwf_minexp_beta, 4.0)
+
+    def test_only_mwf_requires_prefix_caching(self):
+        self.assertEqual(
+            CacheConfig(enable_prefix_caching=False).prefix_cache_eviction_policy,
+            "lru",
+        )
+        with self.assertRaisesRegex(ValidationError, "MWF requires prefix caching"):
+            CacheConfig(prefix_cache_eviction_policy="mwf", enable_prefix_caching=False)
+
+    def test_unsupported_policy_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            CacheConfig(prefix_cache_eviction_policy="unknown")
+
+    def test_all_mwf_parameters_must_be_finite(self):
+        for name in ("a", "b", "alpha", "beta"):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(parameter=name, value=value):
+                    with self.assertRaises(ValidationError):
+                        CacheConfig(**{f"mwf_minexp_{name}": value})
+
+    def test_time_scales_must_be_positive(self):
+        for name in ("alpha", "beta"):
+            for value in (0.0, -1.0):
+                with self.subTest(parameter=name, value=value):
+                    with self.assertRaises(ValidationError):
+                        CacheConfig(**{f"mwf_minexp_{name}": value})
+
+    def test_eviction_settings_do_not_invalidate_compiled_graphs(self):
+        base_hash = CacheConfig().compute_hash()
+        for name, value in (
+            ("prefix_cache_eviction_policy", "mwf"),
+            ("mwf_minexp_a", -1.0),
+            ("mwf_minexp_b", -2.0),
+            ("mwf_minexp_alpha", 3.0),
+            ("mwf_minexp_beta", 4.0),
+        ):
+            with self.subTest(parameter=name):
+                self.assertEqual(CacheConfig(**{name: value}).compute_hash(), base_hash)
+        self.assertNotEqual(CacheConfig(block_size=32).compute_hash(), base_hash)
 
 
 def test_envs_compile_factors_relocation_invariant(tmp_path):

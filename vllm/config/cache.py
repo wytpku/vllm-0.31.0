@@ -22,6 +22,7 @@ _LAYOUT_COMPAT_ALIASES = {
     "NHD": "LBNHC",
     "HND": "LBHNC",
 }
+PrefixCacheEvictionPolicy = Literal["lru", "mwf"]
 
 
 @cache
@@ -141,6 +142,21 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    prefix_cache_eviction_policy: PrefixCacheEvictionPolicy = "lru"
+    """Policy for selecting free GPU prefix-cache blocks for reuse."""
+    mwf_minexp_a: float = Field(default=0.0, allow_inf_nan=False)
+    """MWF MinExp offset a."""
+    mwf_minexp_b: float = Field(default=-19.15349, allow_inf_nan=False)
+    """MWF MinExp offset b."""
+    mwf_minexp_alpha: float = Field(
+        default=1915.332, gt=0, allow_inf_nan=False
+    )
+    """MWF MinExp time scale alpha."""
+    mwf_minexp_beta: float = Field(
+        default=47.63942, gt=0, allow_inf_nan=False
+    )
+    """MWF MinExp time scale beta."""
+
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -301,6 +317,11 @@ class CacheConfig:
             # Feature toggles not impacting compiled graph shape
             "kv_sharing_fast_prefill",
             "swa_bounded_replay",
+            "prefix_cache_eviction_policy",
+            "mwf_minexp_a",
+            "mwf_minexp_b",
+            "mwf_minexp_alpha",
+            "mwf_minexp_beta",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -348,6 +369,12 @@ class CacheConfig:
                 "at https://github.com/vllm-project/vllm/issues."
             )
         return mode
+
+    @model_validator(mode="after")
+    def _validate_prefix_cache_eviction_policy(self) -> "CacheConfig":
+        if(self.prefix_cache_eviction_policy == "mwf" and not self.enable_prefix_caching):
+            raise ValueError("MWF requires prefix caching to be enabled")
+        return self
 
     @field_validator("cache_dtype", mode="after")
     @classmethod

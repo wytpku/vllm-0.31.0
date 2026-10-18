@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import unittest
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
 from typing import Annotated, Literal
@@ -646,6 +647,71 @@ def test_prefix_cache_default():
     args = parser.parse_args(["--prefix-cache-retention-interval", "64"])
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.prefix_cache_retention_interval == 64
+
+
+class TestMWFEngineArgs(unittest.TestCase):
+    """Keep MWF CLI values intact until CacheConfig validates them."""
+
+    def setUp(self):
+        self.parser = EngineArgs.add_cli_args(FlexibleArgumentParser(exit_on_error=False))
+
+    def test_defaults_preserve_upstream_policy_and_original_parameters(self):
+        args = EngineArgs.from_cli_args(self.parser.parse_args([]))
+        direct_args = EngineArgs()
+        self.assertEqual(args.prefix_cache_eviction_policy, "lru")
+        self.assertIsNone(args.enable_prefix_caching)
+        self.assertEqual(direct_args.prefix_cache_eviction_policy, "lru")
+        self.assertIsNone(direct_args.enable_prefix_caching)
+        for name, expected in (
+            ("a", 0.0),
+            ("b", -19.15349),
+            ("alpha", 1915.332),
+            ("beta", 47.63942),
+        ):
+            with self.subTest(parameter=name):
+                value = getattr(args, f"mwf_minexp_{name}")
+                self.assertIsInstance(value, float)
+                self.assertEqual(value, expected)
+                direct_value = getattr(direct_args, f"mwf_minexp_{name}")
+                self.assertIsInstance(direct_value, float)
+                self.assertEqual(direct_value, expected)
+
+    def test_custom_values_survive_cli_to_engine_args(self):
+        args = EngineArgs.from_cli_args(
+            self.parser.parse_args(
+                [
+                    "--prefix-cache-eviction-policy",
+                    "mwf",
+                    "--mwf-minexp-a=1.25",
+                    "--mwf-minexp-b=-2.5",
+                    "--mwf-minexp-alpha=3.75",
+                    "--mwf-minexp-beta=4.125",
+                ]
+            )
+        )
+        self.assertEqual(args.prefix_cache_eviction_policy, "mwf")
+        self.assertEqual(args.mwf_minexp_a, 1.25)
+        self.assertEqual(args.mwf_minexp_b, -2.5)
+        self.assertEqual(args.mwf_minexp_alpha, 3.75)
+        self.assertEqual(args.mwf_minexp_beta, 4.125)
+
+    def test_unsupported_policy_is_rejected_by_cli(self):
+        with self.assertRaises(ArgumentError):
+            self.parser.parse_args(["--prefix-cache-eviction-policy", "unknown"])
+
+    def test_mwf_does_not_override_prefix_caching_selection(self):
+        for flags, expected in (
+            ([], None),
+            (["--enable-prefix-caching"], True),
+            (["--no-enable-prefix-caching"], False),
+        ):
+            with self.subTest(flags=flags):
+                args = EngineArgs.from_cli_args(
+                    self.parser.parse_args(
+                        ["--prefix-cache-eviction-policy", "mwf", *flags]
+                    )
+                )
+                self.assertIs(args.enable_prefix_caching, expected)
 
 
 @pytest.mark.parametrize(

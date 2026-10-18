@@ -169,6 +169,19 @@ if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
     WITH_SOABI)
 endif()
 
+define_extension_target(
+  _mwf_candidate_index
+  DESTINATION vllm
+  LANGUAGE CXX
+  SOURCES
+    csrc/mwf_candidate_index.cpp
+    csrc/mwf_candidate_index_bindings.cpp
+  WITH_SOABI)
+
+set_target_properties(_mwf_candidate_index PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON)
+
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
