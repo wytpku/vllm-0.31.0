@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
+from itertools import islice
 
 MWF_DELTA_SLOPE = 0.00043533405552524906
 MWF_DELTA_INTERCEPT = 16.975203511045493
@@ -10,6 +11,7 @@ MWF_DELTA_INTERCEPT = 16.975203511045493
 if TYPE_CHECKING:
     from vllm._mwf_candidate_index import CandidateKind, MWFCandidateIndex
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
+    from vllm.v1.core.block_pool import BlockPool
 
 @dataclass(frozen=True)
 class MWFScore:
@@ -236,6 +238,64 @@ class MWFEvictionManager:
 
         self._kind = CandidateKind
         self._index = rebuilt
+
+    def select_blocks(
+        self, num_blocks: int, *, pool: "BlockPool"
+    ) -> list["KVCacheBlock"]:
+        if type(num_blocks) is not int or num_blocks < 0:
+            raise ValueError("num_blocks must be a nonnegative integer")
+        if num_blocks == 0:
+            return []
+
+        queue = pool.free_block_queue
+        num_free = pool.get_num_free_blocks()
+        if num_blocks > num_free:
+            raise ValueError("Not enough free blocks")
+
+        now = self._clock()
+        elapsed = now - self._time_origin
+        if not math.isfinite(now) or not math.isfinite(elapsed) or elapsed < 0:
+            raise ValueError("MWF elapsed time must be finite and nonnegative")
+
+        try:
+            if self._index is None or self._index.size() != num_free:
+                raise RuntimeError("MWF index/free queue size mismatch")
+
+            block_ids = self._index.pop_n(num_blocks, elapsed)
+            if len(block_ids) != num_blocks or len(set(block_ids)) != num_blocks:
+                raise RuntimeError("MWF returned invalid candidate IDs")
+
+            selected = []
+            for block_id in block_ids:
+                if not 0 <= block_id < len(pool.blocks):
+                    raise RuntimeError("MWF candidate ID is outside this pool")
+                block = pool.blocks[block_id]
+                prev, nxt = block.prev_free_block, block.next_free_block
+                if (
+                    block.block_id != block_id
+                    or block.pool is not pool
+                    or block.is_null
+                    or block.ref_cnt != 0
+                    or prev is None
+                    or nxt is None
+                    or prev.next_free_block is not block
+                    or nxt.prev_free_block is not block
+                    or not (prev is queue.fake_free_list_head or prev.pool is pool)
+                    or not (nxt is queue.fake_free_list_tail or nxt.pool is pool)
+                ):
+                    raise RuntimeError("MWF selected an invalid free block")
+                selected.append(block)
+        except Exception:
+            snapshot = list(islice(queue.iter_blocks_after(None), num_free + 1))
+            if (
+                len(snapshot) != num_free
+                or snapshot[-1].next_free_block is not queue.fake_free_list_tail
+            ):
+                raise RuntimeError("Cannot rebuild MWF from an invalid free queue")
+            self.resync(snapshot)
+            raise
+
+        return selected
 
     def _ensure_native(self) -> None:
         if self._index is not None:

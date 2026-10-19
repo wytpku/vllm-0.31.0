@@ -10,6 +10,32 @@ from vllm._mwf_candidate_index import CandidateKind, MWFCandidateIndex
 from vllm.v1.core.mwf_eviction import MWFEvictionManager, compute_mwf_score
 
 
+class _LinkedFreeQueueFixture:
+    """Supply linked-queue attributes for manager/native component tests."""
+
+    def __init__(self, blocks):
+        self.fake_free_list_head = SimpleNamespace(pool=None)
+        self.fake_free_list_tail = SimpleNamespace(pool=None)
+        self.num_free_blocks = len(blocks)
+        self.iterated = 0
+        self.yield_limit = None
+        nodes = [self.fake_free_list_head, *blocks, self.fake_free_list_tail]
+        for position, node in enumerate(nodes):
+            node.prev_free_block = nodes[position - 1] if position else None
+            node.next_free_block = (
+                nodes[position + 1] if position + 1 < len(nodes) else None
+            )
+
+    def iter_blocks_after(self, block):
+        current = (self.fake_free_list_head if block is None else block).next_free_block
+        while current is not self.fake_free_list_tail:
+            if self.yield_limit is not None and self.iterated >= self.yield_limit:
+                raise AssertionError("Recovery exceeded its bounded queue traversal")
+            self.iterated += 1
+            yield current
+            current = current.next_free_block
+
+
 class TestMWFCandidateIndexBindings(unittest.TestCase):
     """Exercise the installed native binding through its Python public API."""
 
@@ -105,6 +131,33 @@ class TestMWFNativeRegistration(unittest.TestCase):
             self.block(2, is_null=True),
             *(self.block(block_id) for block_id in (-1, True, 1.0, "1")),
         ]
+
+    def selection_pool(self, hashes, order=None):
+        """Build pool/queue attribute fixtures for the real manager and native index."""
+        pool = SimpleNamespace(blocks=[self.block(i, h) for i, h in enumerate(hashes)])
+        for block in pool.blocks:
+            block.pool = pool
+            block.prev_free_block = block.next_free_block = None
+        order = range(len(pool.blocks)) if order is None else order
+        queue = _LinkedFreeQueueFixture([pool.blocks[i] for i in order])
+        pool.free_block_queue = queue
+        pool.get_num_free_blocks = lambda: queue.num_free_blocks
+        return pool
+
+    def pool_state(self, pool):
+        blocks = [
+            (
+                b.block_hash, b.ref_cnt, id(b.prev_free_block),
+                id(b.next_free_block), id(b.pool),
+            )
+            for b in pool.blocks
+        ]
+        queue = pool.free_block_queue
+        return (
+            blocks,
+            id(queue.fake_free_list_head.next_free_block),
+            id(queue.fake_free_list_tail.prev_free_block),
+        )
 
     def test_three_kinds_and_tracked_scores_determine_native_order(self):
         manager = self.manager
@@ -526,3 +579,114 @@ class TestMWFNativeRegistration(unittest.TestCase):
         self.assertEqual(manager.get_score_keys(1), keys)
         self.assertEqual(manager.get_score(2, now=1001), invalid_record_score)
         self.assertEqual(old_index.pop_n(1, 0.0), [1])
+
+    def test_select_returns_canonical_order_without_mutating_pool_or_metadata(self):
+        manager = self.manager
+        pool = self.selection_pool((1, 1, None, 0), order=(1, 3, 0, 2))
+        manager.on_block_cached(0, 20000)
+        self.clock.return_value = 1010.0
+        manager.on_block_cached(1, 64)
+        for block in pool.free_block_queue.iter_blocks_after(None):
+            manager.on_block_freed(block)
+        before = self.pool_state(pool)
+        records = [
+            (manager.get_score(i, now=1020), manager.get_score_keys(i)) for i in (0, 1)
+        ]
+        pool.free_block_queue.iterated = 0
+        self.clock.return_value = 1020.0
+        selected = manager.select_blocks(3, pool=pool)
+        self.assertEqual([block.block_id for block in selected], [2, 3, 0])
+        for block in selected:
+            self.assertIs(block, pool.blocks[block.block_id])
+        self.assertEqual(manager._index.size(), 1)
+        self.assertEqual(pool.free_block_queue.iterated, 0)
+        self.assertEqual(self.pool_state(pool), before)
+        self.assertEqual(pool.get_num_free_blocks(), 4)
+        self.assertEqual(
+            [
+                (manager.get_score(i, now=1020), manager.get_score_keys(i))
+                for i in (0, 1)
+            ],
+            records,
+        )
+
+    def test_select_zero_and_invalid_counts_do_not_read_clock_or_pop(self):
+        manager = self.manager
+        pool = self.selection_pool((None,))
+        manager.on_block_freed(pool.blocks[0])
+        self.clock.reset_mock()
+        self.clock.side_effect = AssertionError("Invalid count must not read the clock")
+        self.assertEqual(manager.select_blocks(0, pool=pool), [])
+        for count in (-1, True, 1.0, None, 2):
+            with self.subTest(count=count):
+                with self.assertRaises(ValueError):
+                    manager.select_blocks(count, pool=pool)
+                self.assertEqual(manager._index.size(), 1)
+        self.assertEqual(manager._index.pop_n(1, 0.0), [0])
+        self.clock.assert_not_called()
+
+    def test_select_rejects_nonfinite_or_negative_elapsed_before_pop(self):
+        pool = self.selection_pool((None,))
+        cases = [(1000.0, value) for value in (math.nan, math.inf, -math.inf, 999.0)]
+        for origin, now in (*cases, (-1e308, 1e308)):
+            with self.subTest(origin=origin, now=now):
+                clock = Mock(return_value=origin)
+                manager = MWFEvictionManager(clock=clock, **self.params)
+                manager.on_block_freed(pool.blocks[0])
+                clock.return_value = now
+                with self.assertRaisesRegex(ValueError, "elapsed time"):
+                    manager.select_blocks(1, pool=pool)
+                self.assertEqual(manager._index.size(), 1)
+                clock.return_value = origin
+                self.assertIs(manager.select_blocks(1, pool=pool)[0], pool.blocks[0])
+
+    def test_select_missing_index_or_count_mismatch_recovers_then_raises(self):
+        for partial_index in (False, True):
+            with self.subTest(partial_index=partial_index):
+                manager = MWFEvictionManager(clock=self.clock, **self.params)
+                pool = self.selection_pool((None, None))
+                if partial_index:
+                    manager.on_block_freed(pool.blocks[1])
+                with self.assertRaisesRegex(RuntimeError, "size mismatch"):
+                    manager.select_blocks(1, pool=pool)
+                self.assertIsInstance(manager._index, MWFCandidateIndex)
+                self.assertEqual(manager._index.size(), 2)
+                selected = manager.select_blocks(2, pool=pool)
+                self.assertEqual(
+                    [id(block) for block in selected],
+                    [id(block) for block in pool.blocks],
+                )
+
+    def test_select_stale_native_id_recovers_from_healthy_queue_after_pop(self):
+        manager = self.manager
+        pool = self.selection_pool((None, None))
+        manager.on_block_freed(self.block(99, None))
+        manager.on_block_freed(pool.blocks[1])
+        with self.assertRaisesRegex(RuntimeError, "outside this pool"):
+            manager.select_blocks(1, pool=pool)
+        self.assertEqual(manager._index.size(), 2)
+        self.assertEqual(pool.free_block_queue.iterated, 2)
+        selected = manager.select_blocks(2, pool=pool)
+        self.assertEqual(
+            [id(block) for block in selected],
+            [id(block) for block in pool.blocks],
+        )
+
+    def test_select_recovery_rejects_cycles_or_bad_lengths_with_bounded_iteration(self):
+        for damage in ("cycle", "too_short", "too_long"):
+            with self.subTest(damage=damage):
+                manager = MWFEvictionManager(clock=self.clock, **self.params)
+                pool = self.selection_pool((None, None))
+                queue = pool.free_block_queue
+                manager.resync(queue.iter_blocks_after(None))
+                manager._index.clear()
+                queue.iterated = 0
+                if damage == "cycle":
+                    pool.blocks[1].next_free_block = pool.blocks[0]
+                else:
+                    queue.num_free_blocks = 3 if damage == "too_short" else 1
+                queue.yield_limit = queue.num_free_blocks + 1
+                with self.assertRaisesRegex(RuntimeError, "invalid free queue"):
+                    manager.select_blocks(1, pool=pool)
+                self.assertLessEqual(queue.iterated, queue.num_free_blocks + 1)
+                self.assertEqual(manager._index.size(), 0)
