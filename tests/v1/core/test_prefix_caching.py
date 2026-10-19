@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from math import lcm
 from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -2938,6 +2938,398 @@ def test_basic_prefix_caching_disabled():
         req3, 4, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
     assert not blocks
+
+
+_MWF_TEST_PARAMS = dict(
+    minexp_a=-3.0, minexp_b=4.0, minexp_alpha=17.0, minexp_beta=29.0
+)
+
+
+def _make_mwf_pool(monkeypatch, num_blocks=4, policy="mwf"):
+    pool = BlockPool(num_gpu_blocks=num_blocks, enable_caching=True, hash_block_size=16)
+    clock = MagicMock(return_value=0.0)
+    if policy == "mwf":
+        pool.enable_mwf_eviction(**_MWF_TEST_PARAMS)
+        manager = pool.mwf_eviction_manager
+        clock.return_value = manager._time_origin
+        monkeypatch.setattr(manager, "_clock", clock)
+    return pool, clock
+
+
+def _mwf_cache(pool, block, prefix_tokens, label):
+    block_hash = make_block_hash_with_group_id(BlockHash(label.encode()), 0)
+    pool._insert_block_hash(block_hash, block, num_tokens=prefix_tokens)
+    return block_hash
+
+
+def _mwf_pool_state(pool):
+    return (
+        [id(block) for block in pool.free_block_queue.get_all_free_blocks()],
+        [
+            (
+                block.block_hash, block.ref_cnt,
+                id(block.prev_free_block), id(block.next_free_block),
+            )
+            for block in pool.blocks
+        ],
+        {
+            bid: frozenset(hashes)
+            for bid, hashes in pool.cached_block_hashes_by_block.items()
+        },
+    )
+
+
+def test_block_pool_mwf_default_does_not_import_native():
+    with patch("builtins.__import__", wraps=__import__) as imports:
+        pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    assert pool.mwf_eviction_manager is None
+    assert all(
+        call.args[0] != "vllm._mwf_candidate_index" for call in imports.call_args_list
+    )
+    free = pool.free_block_queue.get_all_free_blocks()
+    assert [block.block_id for block in free] == [1, 2, 3]
+
+
+def test_block_pool_mwf_enable_initializes_real_native_candidates(monkeypatch):
+    """Require normal vLLM package imports and the compiled MWF extension."""
+    from vllm._mwf_candidate_index import MWFCandidateIndex
+    from vllm.v1.core.mwf_eviction import compute_mwf_score, compute_mwf_score_keys
+
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    free = pool.free_block_queue.get_all_free_blocks()
+    pool.enable_mwf_eviction(**_MWF_TEST_PARAMS)
+    manager = pool.mwf_eviction_manager
+    assert manager is not None
+    assert isinstance(manager._index, MWFCandidateIndex)
+    assert manager._index.size() == len(free) == 3
+    assert all(not block.is_null for block in free)
+    with pytest.raises(RuntimeError, match="already enabled"):
+        pool.enable_mwf_eviction(**_MWF_TEST_PARAMS)
+    assert pool.mwf_eviction_manager is manager
+    origin = manager._time_origin
+    last, now = origin + 10.0, origin + 20.0
+    monkeypatch.setattr(manager, "_clock", lambda: last)
+    block = free[0]
+    block_hash = make_block_hash_with_group_id(BlockHash(b"mwf-initialization"), 0)
+    pool._insert_block_hash(block_hash, block, num_tokens=64)
+    assert manager.get_score(block.block_id, now=now) == compute_mwf_score(
+        prefix_tokens=64, last_accessed=last, now=now, **_MWF_TEST_PARAMS
+    )
+    assert manager.get_score_keys(block.block_id) == compute_mwf_score_keys(
+        prefix_tokens=64, last_accessed=last, time_origin=origin, **_MWF_TEST_PARAMS
+    )
+    selected = manager.select_blocks(len(free), pool=pool)
+    assert [block.block_id for block in selected] == [2, 3, 1]
+    assert all(block is pool.blocks[block.block_id] for block in selected)
+    assert pool.get_num_free_blocks() == 3
+
+
+@pytest.mark.parametrize(
+    "failure,error,message",
+    [
+        ("parameters", ValueError, "alpha and beta"),
+        ("native", ModuleNotFoundError, "MWF native unavailable"),
+        ("disabled_cache", ValueError, "GPU pool"),
+        ("cpu", ValueError, "GPU pool"),
+        ("busy", RuntimeError, "idle pool"),
+    ],
+)
+def test_block_pool_mwf_enable_failure_keeps_pool_unchanged(failure, error, message):
+    pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=failure != "disabled_cache",
+        hash_block_size=16,
+        medium=MEDIUM_CPU if failure == "cpu" else MEDIUM_GPU,
+    )
+    if failure == "busy":
+        pool.get_new_blocks(1)
+
+    def state():
+        return (
+            [id(block) for block in pool.free_block_queue.get_all_free_blocks()],
+            [
+                (
+                    block.block_hash,
+                    block.ref_cnt,
+                    id(block.prev_free_block),
+                    id(block.next_free_block),
+                )
+                for block in pool.blocks
+            ],
+        )
+
+    before = state()
+    original_import = __import__
+
+    def guarded_import(name, *args, **kwargs):
+        if failure == "native" and name == "vllm._mwf_candidate_index":
+            raise ModuleNotFoundError("MWF native unavailable")
+        return original_import(name, *args, **kwargs)
+
+    params = _MWF_TEST_PARAMS.copy()
+    if failure == "parameters":
+        params["minexp_alpha"] = 0.0
+    with patch("builtins.__import__", side_effect=guarded_import):
+        with pytest.raises(error, match=message):
+            pool.enable_mwf_eviction(**params)
+    assert pool.mwf_eviction_manager is None
+    assert state() == before
+
+
+@pytest.mark.parametrize("policy", ["lru", "mwf"])
+def test_block_pool_mwf_policy_prefers_unhashed_then_uses_original_score(
+    monkeypatch, policy
+):
+    pool, clock = _make_mwf_pool(monkeypatch, policy=policy)
+    old, recent, unhashed = pool.get_new_blocks(3)
+    _mwf_cache(pool, old, 20000, "old")
+    clock.return_value += 10.0
+    _mwf_cache(pool, recent, 64, "recent")
+    clock.return_value += 10.0
+    pool.free_blocks([recent, old, unhashed])
+    assert pool.get_new_blocks(1)[0] is unhashed
+    selected = pool.get_new_blocks(1)[0]
+    assert selected is (old if policy == "mwf" else recent)
+    assert selected.ref_cnt == 1 and selected.block_hash is None
+    assert pool.get_num_free_blocks() == 1
+    if policy == "mwf":
+        assert pool.mwf_eviction_manager._index.size() == 1
+
+
+def test_block_pool_mwf_shared_references_and_foreign_pool_ownership(monkeypatch):
+    pool, clock = _make_mwf_pool(monkeypatch, num_blocks=3)
+    manager = pool.mwf_eviction_manager
+    block = pool.get_new_blocks(1)[0]
+    block_hash = _mwf_cache(pool, block, 64, "shared")
+    pool.free_blocks([block])
+    clock.return_value += 10.0
+    pool.touch([block, block])
+    assert block.ref_cnt == 2
+    assert pool.get_num_free_blocks() == manager._index.size() == 1
+    keys = manager.get_score_keys(block.block_id)
+    assert not pool.reset_prefix_cache()
+    assert manager.get_score_keys(block.block_id) == keys
+    assert block.block_hash == block_hash
+    pool.evict_blocks({block.block_id})
+    assert block.ref_cnt == 2 and block.block_hash is None
+    with pytest.raises(KeyError):
+        manager.get_score_keys(block.block_id)
+    pool.free_blocks([block])
+    assert block.ref_cnt == 1 and manager._index.size() == 1
+    pool.free_blocks([block])
+    assert block.ref_cnt == 0
+    assert pool.get_num_free_blocks() == manager._index.size() == 2
+    foreign_pool, _ = _make_mwf_pool(monkeypatch, num_blocks=2)
+    foreign = foreign_pool.get_new_blocks(1)[0]
+    before = _mwf_pool_state(pool)
+    with pytest.raises(ValueError):
+        pool.touch([block, foreign])
+    assert _mwf_pool_state(pool) == before
+    pool.free_blocks([foreign])
+    assert foreign.ref_cnt == 0
+    foreign_manager = foreign_pool.mwf_eviction_manager
+    assert foreign_pool.get_num_free_blocks() == foreign_manager._index.size() == 1
+    assert pool.get_num_free_blocks() == manager._index.size() == 2
+
+
+def test_block_pool_mwf_allocation_failure_recovers_without_losing_capacity(
+    monkeypatch,
+):
+    pool, clock = _make_mwf_pool(monkeypatch)
+    manager = pool.mwf_eviction_manager
+    before = _mwf_pool_state(pool)
+    with pytest.raises(ValueError, match="positive prefix length"):
+        _mwf_cache(pool, pool.blocks[1], None, "invalid-prefix")
+    assert _mwf_pool_state(pool) == before
+    assert manager._index.erase(1)
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        pool.get_new_blocks(1)
+    assert _mwf_pool_state(pool) == before
+    assert manager._index.size() == pool.get_num_free_blocks() == 3
+    assert pool.get_new_blocks(1)[0] is pool.blocks[1]
+    before = _mwf_pool_state(pool)
+    metrics = MagicMock()
+    metrics.on_block_allocated.side_effect = RuntimeError("allocation metrics failed")
+    with patch.object(pool, "metrics_collector", metrics):
+        with pytest.raises(RuntimeError, match="allocation metrics failed"):
+            pool.get_new_blocks(2)
+    assert _mwf_pool_state(pool) == before
+    assert manager._index.size() == pool.get_num_free_blocks() == 2
+    with patch.object(
+        manager,
+        "on_block_allocated",
+        side_effect=RuntimeError("touch notification failed"),
+    ):
+        with pytest.raises(RuntimeError, match="touch notification failed"):
+            pool.touch([pool.blocks[2]])
+    assert _mwf_pool_state(pool) == before
+    assert manager._index.size() == pool.get_num_free_blocks() == 2
+    clock.return_value = float("nan")
+    with pytest.raises(ValueError, match="elapsed time"):
+        pool.get_new_blocks(1)
+    assert _mwf_pool_state(pool) == before
+    assert manager._index.size() == pool.get_num_free_blocks() == 2
+
+
+@pytest.mark.parametrize("operation", ["allocation", "reset"])
+def test_block_pool_mwf_watcher_failure_retries_before_invalidating_aliases(
+    monkeypatch, operation
+):
+    pool, clock = _make_mwf_pool(monkeypatch, num_blocks=3)
+    manager = pool.mwf_eviction_manager
+    cached, spare = pool.get_new_blocks(2)
+    primary = _mwf_cache(pool, cached, 64, "primary")
+    origin = clock.return_value
+    clock.return_value += 10.0
+    alias = _mwf_cache(pool, cached, 32, "alias")
+    expected_age = clock.return_value - origin
+    score = manager.get_score(cached.block_id, now=clock.return_value)
+    assert score.age_s == expected_age and score.prefix_tokens == 64
+    calls = []
+
+    def watcher(block):
+        assert block is cached and block.block_hash == primary and block.ref_cnt == 0
+        assert all(
+            pool.cached_block_hash_to_block.get_one_block(h) is cached
+            for h in (primary, alias)
+        )
+        calls.append(block)
+        if len(calls) == 1:
+            raise RuntimeError("reader notification failed")
+
+    pool.free_blocks([spare])
+    pool.unpin_blocks([cached], watcher)
+    before = _mwf_pool_state(pool)
+    def invoke():
+        if operation == "allocation":
+            return pool.get_new_blocks(2)
+        return pool.reset_prefix_cache()
+
+    with pytest.raises(RuntimeError, match="reader notification failed"):
+        invoke()
+    assert _mwf_pool_state(pool) == before
+    assert manager._index.size() == pool.get_num_free_blocks() == 2
+    result = invoke()
+    assert len(calls) == 2
+    assert not pool.cached_block_hash_to_block
+    assert not pool.cached_block_hashes_by_block
+    assert cached.block_hash is None
+    with pytest.raises(KeyError):
+        manager.get_score_keys(cached.block_id)
+    if operation == "allocation":
+        assert all(block.ref_cnt == 1 for block in result)
+        assert manager._index.size() == pool.get_num_free_blocks() == 0
+    else:
+        assert result is True
+        assert manager._index.size() == pool.get_num_free_blocks() == 2
+
+
+def test_block_pool_mwf_move_hashes_preserves_scoring_age_and_aliases(monkeypatch):
+    pool, clock = _make_mwf_pool(monkeypatch)
+    manager = pool.mwf_eviction_manager
+    source, destination = pool.get_new_blocks(2)
+    primary = _mwf_cache(pool, source, 64, "cow-primary")
+    clock.return_value += 10.0
+    alias = _mwf_cache(pool, source, 32, "cow-alias")
+    now = clock.return_value + 10.0
+    score = manager.get_score(source.block_id, now=now)
+    keys = manager.get_score_keys(source.block_id)
+    clock.reset_mock()
+    clock.side_effect = AssertionError("Moving content must retain its timestamp")
+    pool.move_block_hashes(source, destination)
+    assert source.block_hash is None
+    assert all(
+        pool.cached_block_hash_to_block.get_one_block(h) is destination
+        for h in (primary, alias)
+    )
+    assert manager.get_score(destination.block_id, now=now) == score
+    assert manager.get_score_keys(destination.block_id) == keys
+    with pytest.raises(KeyError):
+        manager.get_score_keys(source.block_id)
+    assert manager._index.size() == pool.get_num_free_blocks() == 1
+    clock.assert_not_called()
+
+
+@pytest.mark.parametrize("policy", ["lru", "mwf"])
+def test_kv_cache_manager_mwf_request_lifecycle_and_parameter_forwarding(
+    monkeypatch, policy
+):
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(16, 4), max_model_len=128, enable_caching=True,
+        hash_block_size=16, prefix_cache_eviction_policy=policy,
+        **{f"mwf_{name}": value for name, value in _MWF_TEST_PARAMS.items()},
+    )
+    pool = manager.block_pool
+    evictor = pool.mwf_eviction_manager
+    assert (evictor is not None) == (policy == "mwf")
+    if evictor is not None:
+        clock = MagicMock(return_value=evictor._time_origin)
+        monkeypatch.setattr(evictor, "_clock", clock)
+    producer = make_request("mwf-producer", list(range(48)), 16, sha256)
+    assert manager.allocate_slots(producer, 48) is not None
+    original = list(manager.get_blocks(producer.request_id).blocks[0])
+    assert all(block.ref_cnt == 1 for block in original)
+    if evictor is not None:
+        from vllm.v1.core.mwf_eviction import compute_mwf_score
+
+        prefixes = [evictor.get_score(b.block_id).prefix_tokens for b in original]
+        assert prefixes == [16, 32, 48]
+        now = clock.return_value + 1
+        assert evictor.get_score(original[2].block_id, now=now) == compute_mwf_score(
+            prefix_tokens=48,
+            last_accessed=clock.return_value,
+            now=now,
+            **_MWF_TEST_PARAMS,
+        )
+        clock.return_value += 10.0
+    manager.free(producer)
+    repeated = make_request("mwf-repeated", list(range(48)), 16, sha256)
+    computed, hits, _ = manager.get_computed_blocks(repeated)
+    assert hits == 32
+    assert all(a is b for a, b in zip(computed.blocks[0], original[:2]))
+    assert manager.allocate_slots(repeated, 48 - hits, hits, computed) is not None
+    repeated_blocks = manager.get_blocks(repeated.request_id).blocks[0]
+    assert all(block.ref_cnt == 1 for block in repeated_blocks)
+    manager.free(repeated)
+    pressure = make_request("mwf-pressure", list(range(100, 148)), 16, sha256)
+    assert manager.allocate_slots(pressure, 48) is not None
+    after_pressure = make_request("mwf-miss", list(range(48)), 16, sha256)
+    assert manager.get_computed_blocks(after_pressure)[1] == 0
+    manager.free(pressure)
+    assert pool.get_num_free_blocks() == 3
+    if evictor is not None:
+        assert evictor._index.size() == 3
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    ["cache_off", "dcp", "lookahead", "eagle", "groups", "non_causal", "policy"],
+)
+def test_kv_cache_manager_mwf_rejects_unsupported_configuration(unsupported):
+    config = make_kv_cache_config(16, 4)
+    kwargs = dict(
+        enable_caching=True, hash_block_size=16, prefix_cache_eviction_policy="mwf"
+    )
+    if unsupported == "cache_off":
+        kwargs["enable_caching"] = False
+    elif unsupported == "dcp":
+        kwargs["dcp_world_size"] = 2
+    elif unsupported == "lookahead":
+        kwargs["num_prefill_lookahead"] = 1
+    elif unsupported == "eagle":
+        kwargs["use_eagle"] = True
+    elif unsupported == "groups":
+        config.kv_cache_groups.append(
+            KVCacheGroupSpec(["other"], config.kv_cache_groups[0].kv_cache_spec)
+        )
+    elif unsupported == "non_causal":
+        config.kv_cache_groups[0].kv_cache_spec = replace(
+            config.kv_cache_groups[0].kv_cache_spec, non_causal=True
+        )
+    else:
+        kwargs["prefix_cache_eviction_policy"] = "unknown"
+    with pytest.raises(ValueError):
+        make_kv_cache_manager(config, max_model_len=128, **kwargs)
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

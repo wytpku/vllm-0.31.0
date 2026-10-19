@@ -1,17 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 import time
-from dataclasses import dataclass
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 from itertools import islice
+from typing import TYPE_CHECKING
 
 MWF_DELTA_SLOPE = 0.00043533405552524906
 MWF_DELTA_INTERCEPT = 16.975203511045493
 
 if TYPE_CHECKING:
     from vllm._mwf_candidate_index import CandidateKind, MWFCandidateIndex
-    from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
 
 @dataclass(frozen=True)
 class MWFScore:
@@ -54,15 +57,14 @@ def compute_mwf_score(
         -(minexp_b + age_s) / minexp_beta,
     )
     frequency = math.exp(log_frequency)
-    recompute_cost = (
-        MWF_DELTA_SLOPE * prefix_tokens + MWF_DELTA_INTERCEPT
-    )
+    recompute_cost = MWF_DELTA_SLOPE * prefix_tokens + MWF_DELTA_INTERCEPT
     return MWFScore(
         weight=frequency * recompute_cost,
         frequency=frequency,
         prefix_tokens=prefix_tokens,
         age_s=age_s,
     )
+
 
 def compute_mwf_score_keys(
     *,
@@ -101,6 +103,7 @@ def compute_mwf_score_keys(
     if not all(math.isfinite(key) for key in keys):
         raise ValueError("MWF score keys must be finite")
     return keys
+
 
 @dataclass
 class _BlockMetadata:
@@ -208,12 +211,34 @@ class MWFEvictionManager:
         if self._index is not None:
             self._index.erase(block_id)
 
+    def on_block_moved(self, src_block_id: int, dst_block_id: int) -> None:
+        """Transfer the score when CoW moves live cache entries between pages.
+
+        Call after moving hashes. The pool must resync on a native update
+        failure, since the metadata already describes the new hash ownership.
+        """
+        self._check_block_id(src_block_id)
+        self._check_block_id(dst_block_id)
+        if src_block_id == dst_block_id:
+            raise ValueError("MWF content migration requires distinct blocks")
+        metadata = self._metadata.pop(src_block_id, None)
+        self._metadata.pop(dst_block_id, None)
+        if metadata is not None:
+            self._metadata[dst_block_id] = metadata
+        if self._index is not None:
+            assert self._kind is not None
+            self._index.update(src_block_id, self._kind.UNHASHED)
+            if metadata is None:
+                self._index.update(dst_block_id, self._kind.MISSING)
+            else:
+                self._refresh_tracked_candidate(dst_block_id, metadata)
+
     def reset(self) -> None:
         if self._index is not None:
             self._index.clear()
         self._metadata.clear()
 
-    def resync(self, free_blocks: Iterable['KVCacheBlock']) -> None:
+    def resync(self, free_blocks: Iterable["KVCacheBlock"]) -> None:
         from vllm._mwf_candidate_index import CandidateKind, MWFCandidateIndex
 
         rebuilt = MWFCandidateIndex(

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any
+from itertools import islice
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -28,6 +29,9 @@ from vllm.v1.core.kv_cache_utils import (
     to_event_extra_keys,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.mwf_eviction import MWFEvictionManager
 
 logger = init_logger(__name__)
 
@@ -194,6 +198,40 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        self.mwf_eviction_manager: "MWFEvictionManager | None" = None
+
+    def enable_mwf_eviction(
+        self,
+        *,
+        minexp_a: float,
+        minexp_b: float,
+        minexp_alpha: float,
+        minexp_beta: float,
+    ) -> None:
+        """Attach MWF to a cold GPU pool before any request acquires blocks."""
+        if self.mwf_eviction_manager is not None:
+            raise RuntimeError("MWF is already enabled for this pool")
+        if not self.enable_caching or self.medium != MEDIUM_GPU:
+            raise ValueError("MWF requires a GPU pool with prefix caching")
+        if (
+            self.get_num_free_blocks() != self.num_gpu_blocks - 1
+            or len(self.cached_block_hash_to_block) != 0
+            or self.cached_block_hashes_by_block
+            or self._reuse_watchers
+        ):
+            raise RuntimeError("MWF requires an idle pool with an empty cache")
+
+        from vllm.v1.core.mwf_eviction import MWFEvictionManager
+
+        manager = MWFEvictionManager(
+            minexp_a=minexp_a,
+            minexp_b=minexp_b,
+            minexp_alpha=minexp_alpha,
+            minexp_beta=minexp_beta,
+        )
+        manager.resync(self.free_block_queue.get_all_free_blocks())
+        self.mwf_eviction_manager = manager
+        logger.info("MWF GPU prefix-cache eviction enabled")
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -593,12 +631,16 @@ class BlockPool:
     def _remove_cached_block_hashes(
         self,
         block: KVCacheBlock,
+        *,
+        update_mwf: bool = True,
     ) -> list[BlockHashWithGroupId]:
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
             block_hashes.append(block.block_hash)
         block_hashes.extend(self.cached_block_hashes_by_block.pop(block.block_id, ()))
         if not block_hashes:
+            if update_mwf and self.mwf_eviction_manager is not None:
+                self.mwf_eviction_manager.on_block_reused(block.block_id)
             return []
 
         removed_hashes: list[BlockHashWithGroupId] = []
@@ -609,6 +651,12 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
+        if update_mwf and self.mwf_eviction_manager is not None:
+            try:
+                self.mwf_eviction_manager.on_block_reused(block.block_id)
+            except Exception:
+                self._resync_mwf()
+                raise
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -631,6 +679,8 @@ class BlockPool:
         block_hash_with_group_id: BlockHashWithGroupId,
         block: KVCacheBlock,
         num_tokens: int | None,
+        *,
+        update_mwf: bool = True,
     ) -> None:
         if block.block_hash == block_hash_with_group_id:
             return
@@ -640,13 +690,28 @@ class BlockPool:
         ):
             return
 
-        if block.block_hash is None:
+        new_content = block.block_hash is None
+        if (
+            update_mwf
+            and new_content
+            and self.mwf_eviction_manager is not None
+            and (type(num_tokens) is not int or num_tokens <= 0)
+        ):
+            raise ValueError("MWF cache insertion requires a positive prefix length")
+        if new_content:
             block.set_block_hash(block_hash_with_group_id, num_tokens=num_tokens)
         else:
             self.cached_block_hashes_by_block.setdefault(block.block_id, set()).add(
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        if update_mwf and new_content and self.mwf_eviction_manager is not None:
+            try:
+                assert num_tokens is not None
+                self.mwf_eviction_manager.on_block_cached(block.block_id, num_tokens)
+            except Exception:
+                self._resync_mwf()
+                raise
 
     def move_block_hashes(
         self,
@@ -662,9 +727,53 @@ class BlockPool:
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
-        for block_hash in self._remove_cached_block_hashes(src_block):
+        moved_hashes = self._remove_cached_block_hashes(src_block, update_mwf=False)
+        for block_hash in moved_hashes:
             # `num_tokens` only applies to the first (primary) insertion.
-            self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+            self._insert_block_hash(
+                block_hash, dst_block, num_tokens=num_tokens, update_mwf=False
+            )
+        if self.mwf_eviction_manager is not None:
+            try:
+                if moved_hashes:
+                    self.mwf_eviction_manager.on_block_moved(
+                        src_block.block_id, dst_block.block_id
+                    )
+                else:
+                    self.mwf_eviction_manager.on_block_reused(src_block.block_id)
+            except Exception:
+                self._resync_mwf()
+                raise
+
+    def _resync_mwf(self) -> None:
+        """Recover candidates from the real queue after a failed notification."""
+        assert self.mwf_eviction_manager is not None
+        queue = self.free_block_queue
+        num_free = self.get_num_free_blocks()
+        blocks = list(islice(queue.iter_blocks_after(None), num_free + 1))
+        last = blocks[-1] if blocks else queue.fake_free_list_head
+        if (
+            len(blocks) != num_free
+            or last.next_free_block is not queue.fake_free_list_tail
+        ):
+            raise RuntimeError("Cannot rebuild MWF from an invalid free queue")
+        if any(
+            block.pool is not self
+            or not 0 <= block.block_id < len(self.blocks)
+            or self.blocks[block.block_id] is not block
+            for block in blocks
+        ):
+            raise RuntimeError("Cannot rebuild MWF from foreign free blocks")
+        self.mwf_eviction_manager.resync(blocks)
+
+    def _register_mwf_free_blocks(self, blocks: Iterable[KVCacheBlock]) -> None:
+        if self.mwf_eviction_manager is not None:
+            try:
+                for block in blocks:
+                    self.mwf_eviction_manager.on_block_freed(block)
+            except Exception:
+                self._resync_mwf()
+                raise
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -680,6 +789,9 @@ class BlockPool:
         """
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+
+        if self.mwf_eviction_manager is not None:
+            return self._get_new_blocks_mwf(num_blocks)
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
@@ -702,11 +814,45 @@ class BlockPool:
                     self.metrics_collector.on_block_allocated(block)
         return ret
 
+    def _get_new_blocks_mwf(self, num_blocks: int) -> list[KVCacheBlock]:
+        assert self.mwf_eviction_manager is not None
+        selected = self.mwf_eviction_manager.select_blocks(num_blocks, pool=self)
+        detached: list[KVCacheBlock] = []
+        acquired: list[KVCacheBlock] = []
+        try:
+            for block in selected:
+                self.free_block_queue.remove(block)
+                detached.append(block)
+            if self._reuse_watchers:
+                self._notify_reuse(selected)
+            for block in selected:
+                self._maybe_evict_cached_block(block)
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                acquired.append(block)
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_allocated(block)
+        except Exception:
+            # Hash invalidations and watcher callbacks cannot be undone. Return
+            # every reserved page so failure never leaks capacity or references.
+            for block in acquired:
+                block.ref_cnt -= 1
+            self.free_block_queue.prepend_n(detached)
+            self._resync_mwf()
+            raise
+        return selected
+
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
         for block in blocks:
             watcher = self._reuse_watchers.pop(block.block_id, None)
             if watcher is not None:
-                watcher(block)
+                try:
+                    watcher(block)
+                except Exception:
+                    # A failed notification must be retried before overwriting
+                    # a page whose reader may still be using it.
+                    self._reuse_watchers.setdefault(block.block_id, watcher)
+                    raise
 
     def unpin_blocks(
         self,
@@ -715,8 +861,8 @@ class BlockPool:
     ) -> None:
         """Release references to blocks that stay readable until reused.
 
-        The blocks become last-resort eviction candidates regardless of prefix
-        caching: they join the tail of the free queue and count as free.
+        The blocks join the tail of the free queue and count as free. LRU
+        reuses them last; MWF selects them by its normal candidate priority.
         ``on_reuse`` fires when ``get_new_blocks`` hands a block out (or the
         cache is reset), so the caller can stop reading it.
         """
@@ -728,6 +874,7 @@ class BlockPool:
             if block.ref_cnt == 0:
                 released.append(block)
         self.free_block_queue.append_n(released)
+        self._register_mwf_free_blocks(released)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
@@ -761,6 +908,9 @@ class BlockPool:
             blocks: A list of blocks to touch.
 
         """
+        if self.mwf_eviction_manager is not None:
+            self._touch_mwf(blocks)
+            return
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
@@ -769,6 +919,37 @@ class BlockPool:
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+
+    def _touch_mwf(self, blocks: Sequence[KVCacheBlock]) -> None:
+        assert self.mwf_eviction_manager is not None
+        for block in blocks:
+            if (
+                block.pool is not self
+                or not 0 <= block.block_id < len(self.blocks)
+                or self.blocks[block.block_id] is not block
+                or (block.ref_cnt < 0 and not block.is_null)
+            ):
+                raise ValueError("MWF can only touch canonical blocks from this pool")
+        detached: list[KVCacheBlock] = []
+        acquired: list[KVCacheBlock] = []
+        try:
+            for block in blocks:
+                if not block.is_null and block.block_hash is not None:
+                    self.mwf_eviction_manager.on_block_accessed(block.block_id)
+                if block.ref_cnt == 0 and not block.is_null:
+                    self.free_block_queue.remove(block)
+                    detached.append(block)
+                    self.mwf_eviction_manager.on_block_allocated(block.block_id)
+                block.ref_cnt += 1
+                acquired.append(block)
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_accessed(block)
+        except Exception:
+            for block in reversed(acquired):
+                block.ref_cnt -= 1
+            self.free_block_queue.prepend_n(detached)
+            self._resync_mwf()
+            raise
 
     def is_block_writable(self, block: KVCacheBlock) -> bool:
         """Return whether a block can be mutated by its sole owner."""
@@ -804,6 +985,8 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        if self.mwf_eviction_manager is not None:
+            self._register_mwf_free_blocks(blocks_to_evict_first + blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
@@ -846,17 +1029,23 @@ class BlockPool:
             )
             return False
 
-        # Remove all hashes so that no new blocks will hit.
-        self.cached_block_hash_to_block = BlockHashToBlockMap()
-        self.cached_block_hashes_by_block.clear()
         if self._reuse_watchers:
             self._notify_reuse(
                 [self.blocks[block_id] for block_id in list(self._reuse_watchers)]
             )
 
+        # Notify readers before invalidating any cache metadata, so a failed
+        # callback leaves the cache and its candidate index consistent.
+        self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self.cached_block_hashes_by_block.clear()
+
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+
+        if self.mwf_eviction_manager is not None:
+            self.mwf_eviction_manager.reset()
+            self._resync_mwf()
 
         if self.metrics_collector:
             self.metrics_collector.reset()

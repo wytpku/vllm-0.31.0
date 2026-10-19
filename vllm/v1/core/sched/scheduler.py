@@ -310,6 +310,13 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        if self.cache_config.prefix_cache_eviction_policy == "mwf":
+            # The cache manager receives a PCP size of 1 below, so validate
+            # the actual configuration before that scheduler-side projection.
+            if self.pcp_world_size != 1:
+                raise ValueError("MWF currently requires PCP world size of 1")
+            if self.use_eagle:
+                raise ValueError("MWF currently does not support EAGLE/MTP")
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -328,6 +335,11 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            prefix_cache_eviction_policy=self.cache_config.prefix_cache_eviction_policy,
+            mwf_minexp_a=self.cache_config.mwf_minexp_a,
+            mwf_minexp_b=self.cache_config.mwf_minexp_b,
+            mwf_minexp_alpha=self.cache_config.mwf_minexp_alpha,
+            mwf_minexp_beta=self.cache_config.mwf_minexp_beta,
         )
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:

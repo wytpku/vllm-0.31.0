@@ -239,6 +239,42 @@ class TestMWFMetadata(unittest.TestCase):
         self.assertEqual(manager.get_score(1, now=41.0).prefix_tokens, 64)
         self.assertEqual(manager.get_score(2, now=20.0), unchanged)
 
+    def test_content_migration_preserves_age_and_cost_without_reading_clock(self):
+        clock = Mock(return_value=10.0)
+        manager = MWFEvictionManager(clock=clock, **self.params())
+        manager.on_block_cached(1, 64)
+        manager.on_block_cached(2, 16)
+        original = manager.get_score(1, now=20.0)
+        keys = manager.get_score_keys(1)
+        clock.reset_mock()
+        clock.side_effect = AssertionError("A copy must not count as a cache access")
+        manager.on_block_moved(1, 2)
+        self.assertEqual(manager.get_score(2, now=20.0), original)
+        self.assertEqual(manager.get_score_keys(2), keys)
+        with self.assertRaises(KeyError):
+            manager.get_score(1, now=20.0)
+        self.assertIsNone(manager._index)
+        clock.assert_not_called()
+
+    def test_content_migration_missing_record_drops_stale_destination_metadata(self):
+        manager = MWFEvictionManager(clock=lambda: 10.0, **self.params())
+        manager.on_block_cached(2, 16)
+        manager.on_block_moved(1, 2)
+        with self.assertRaises(KeyError):
+            manager.get_score(2, now=20.0)
+
+    def test_invalid_content_migration_preserves_both_records(self):
+        manager = MWFEvictionManager(clock=lambda: 10.0, **self.params())
+        manager.on_block_cached(1, 64)
+        manager.on_block_cached(2, 16)
+        scores = [manager.get_score(i, now=20.0) for i in (1, 2)]
+        for src, dst in ((1, 1), (True, 2), (1, -1), (1.0, 2), (1, None)):
+            with self.subTest(src=src, dst=dst), self.assertRaises(ValueError):
+                manager.on_block_moved(src, dst)
+            self.assertEqual(
+                [manager.get_score(i, now=20.0) for i in (1, 2)], scores
+            )
+
     def test_explicit_zero_now_does_not_read_clock(self):
         clock = Mock(return_value=0.0)
         manager = MWFEvictionManager(clock=clock, **self.params())

@@ -6,7 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
-from vllm.distributed.kv_events import BlockStored, KVCacheEvent
+from vllm.config.cache import PrefixCacheEvictionPolicy
+from vllm.distributed.kv_events import MEDIUM_GPU, BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
@@ -20,7 +21,9 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     MambaSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
@@ -129,6 +132,12 @@ class KVCacheBlocks:
 
 
 class KVCacheManager:
+    """Manage request KV blocks and opt-in GPU prefix-cache eviction.
+
+    MWF initially supports one ordinary causal FullAttention group sharing
+    the coordinator's GPU pool, without EAGLE or context parallelism.
+    """
+
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -146,7 +155,46 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        prefix_cache_eviction_policy: PrefixCacheEvictionPolicy = "lru",
+        mwf_minexp_a: float = 0.0,
+        mwf_minexp_b: float = -19.15349,
+        mwf_minexp_alpha: float = 1915.332,
+        mwf_minexp_beta: float = 47.63942,
     ) -> None:
+        if prefix_cache_eviction_policy not in ("lru", "mwf"):
+            raise ValueError(
+                "Unknown prefix cache eviction policy: "
+                f"{prefix_cache_eviction_policy}"
+            )
+        if prefix_cache_eviction_policy == "mwf":
+            if not enable_caching:
+                raise ValueError("MWF requires prefix caching")
+            if dcp_world_size != 1 or pcp_world_size != 1:
+                raise ValueError("MWF currently requires DCP/PCP world sizes of 1")
+            if num_prefill_lookahead != 0:
+                raise ValueError("MWF currently does not support prefill lookahead")
+            if len(kv_cache_config.kv_cache_groups) != 1:
+                raise ValueError("MWF currently requires exactly one KV cache group")
+            group = kv_cache_config.kv_cache_groups[0]
+            if (
+                use_eagle
+                or group.is_eagle_group
+                or group.role != KVCacheGroupRole.DEFAULT
+                or group.host_resident
+            ):
+                raise ValueError(
+                    "MWF currently supports only a non-EAGLE default GPU cache group"
+                )
+            spec = group.kv_cache_spec
+            if type(spec) is not FullAttentionSpec or (
+                spec.sliding_window is not None
+                or spec.attention_chunk_size is not None
+                or spec.non_causal
+            ):
+                raise ValueError(
+                    "MWF currently requires an ordinary causal FullAttentionSpec"
+                )
+
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
@@ -195,6 +243,20 @@ class KVCacheManager:
                     manager.shared_prefix_checkpoint = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        if prefix_cache_eviction_policy == "mwf":
+            if self.block_pool.medium != MEDIUM_GPU or any(
+                manager.block_pool is not self.block_pool
+                for manager in self.coordinator.single_type_managers
+            ):
+                raise ValueError(
+                    "MWF requires all cache groups to share the GPU block pool"
+                )
+            self.block_pool.enable_mwf_eviction(
+                minexp_a=mwf_minexp_a,
+                minexp_b=mwf_minexp_b,
+                minexp_alpha=mwf_minexp_alpha,
+                minexp_beta=mwf_minexp_beta,
+            )
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers

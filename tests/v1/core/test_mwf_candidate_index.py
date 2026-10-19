@@ -450,6 +450,32 @@ class TestMWFNativeRegistration(unittest.TestCase):
         self.assertEqual(manager._index.pop_n(1, 0.0), [1])
         self.clock.assert_not_called()
 
+    def test_moved_content_keeps_score_and_reclassifies_both_free_candidates(self):
+        manager = self.manager
+        manager.on_block_cached(1, 128)
+        score = manager.get_score(1, now=1020.0)
+        keys = manager.get_score_keys(1)
+        for block in (self.block(1), self.block(2, None), self.block(3)):
+            manager.on_block_freed(block)
+        self.clock.reset_mock()
+        self.clock.side_effect = AssertionError("Migration must preserve access time")
+        manager.on_block_moved(1, 2)
+        self.assertEqual(manager.get_score(2, now=1020.0), score)
+        self.assertEqual(manager.get_score_keys(2), keys)
+        with self.assertRaises(KeyError):
+            manager.get_score(1, now=1020.0)
+        self.assertEqual(manager._index.pop_n(3, 20.0), [1, 3, 2])
+        self.clock.assert_not_called()
+
+    def test_moved_untracked_content_remains_missing_in_native_index(self):
+        manager = self.manager
+        for block in (self.block(1), self.block(2, None)):
+            manager.on_block_freed(block)
+        manager.on_block_moved(1, 2)
+        with self.assertRaises(KeyError):
+            manager.get_score_keys(2)
+        self.assertEqual(manager._index.pop_n(2, 20.0), [1, 2])
+
     def test_reset_clears_all_kinds_and_reuses_native_index_for_new_content(self):
         manager = self.manager
         manager.on_block_cached(1, 64)

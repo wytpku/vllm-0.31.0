@@ -690,10 +690,13 @@ class TestMWFEngineArgs(unittest.TestCase):
             )
         )
         self.assertEqual(args.prefix_cache_eviction_policy, "mwf")
-        self.assertEqual(args.mwf_minexp_a, 1.25)
-        self.assertEqual(args.mwf_minexp_b, -2.5)
-        self.assertEqual(args.mwf_minexp_alpha, 3.75)
-        self.assertEqual(args.mwf_minexp_beta, 4.125)
+        for name, expected in (
+            ("a", 1.25), ("b", -2.5), ("alpha", 3.75), ("beta", 4.125)
+        ):
+            with self.subTest(parameter=name):
+                value = getattr(args, f"mwf_minexp_{name}")
+                self.assertIsInstance(value, float)
+                self.assertEqual(value, expected)
 
     def test_unsupported_policy_is_rejected_by_cli(self):
         with self.assertRaises(ArgumentError):
