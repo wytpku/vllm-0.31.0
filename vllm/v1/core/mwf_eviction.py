@@ -201,6 +201,11 @@ class MWFEvictionManager:
             self._index.update(block_id, self._kind.UNHASHED)
         self._metadata.pop(block_id, None)
 
+    def on_block_allocated(self, block_id: int) -> None:
+        self._check_block_id(block_id)
+        if self._index is not None:
+            self._index.erase(block_id)
+
     def _ensure_native(self) -> None:
         if self._index is not None:
             return

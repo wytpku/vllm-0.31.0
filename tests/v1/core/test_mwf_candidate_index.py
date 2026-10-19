@@ -336,3 +336,63 @@ class TestMWFNativeRegistration(unittest.TestCase):
                 self.assertEqual(manager.get_score(1, now=1000.0), score)
                 self.assertEqual(manager._index.size(), 1)
         self.assertEqual(manager._index.pop_n(1, 0.0), [1])
+
+    def test_allocated_removes_each_candidate_kind_but_keeps_scoring_record(self):
+        for removed in (1, 2, 3):
+            with self.subTest(removed=removed):
+                manager = MWFEvictionManager(clock=self.clock, **self.params)
+                manager.on_block_cached(1, 64)
+                for block in (self.block(1), self.block(2), self.block(3, None)):
+                    manager.on_block_freed(block)
+                keys = manager.get_score_keys(1)
+                score = manager.get_score(1, now=1000.0)
+                manager.on_block_allocated(removed)
+                manager.on_block_allocated(removed)
+                manager.on_block_allocated(99)
+                self.assertEqual(manager.get_score_keys(1), keys)
+                self.assertEqual(manager.get_score(1, now=1000.0), score)
+                self.assertEqual(manager._index.size(), 2)
+                self.assertEqual(
+                    manager._index.pop_n(2, 0.0),
+                    [block_id for block_id in (3, 2, 1) if block_id != removed],
+                )
+
+    def test_allocated_access_then_free_registers_latest_priority(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_freed(self.block(1))
+        self.clock.return_value = 1010.0
+        manager.on_block_cached(2, 64)
+        manager.on_block_freed(self.block(2))
+        manager.on_block_allocated(1)
+        self.clock.return_value = 1020.0
+        manager.on_block_accessed(1)
+        self.assertEqual(manager.get_score(1, now=1020.0).age_s, 0.0)
+        self.assertEqual(manager._index.size(), 1)
+        manager.on_block_freed(self.block(1))
+        self.assertEqual(manager._index.size(), 2)
+        self.assertEqual(manager._index.pop_n(2, 20.0), [2, 1])
+
+    def test_allocated_lazy_and_invalid_notifications_preserve_other_state(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        keys, score = manager.get_score_keys(1), manager.get_score(1, now=1000.0)
+        self.clock.reset_mock()
+        self.clock.side_effect = AssertionError("Allocation must not read the clock")
+        with patch("builtins.__import__", side_effect=AssertionError):
+            manager.on_block_allocated(1)
+            manager.on_block_allocated(1)
+            manager.on_block_allocated(99)
+        self.assertIsNone(manager._index)
+        self.assertEqual(manager.get_score_keys(1), keys)
+        self.assertEqual(manager.get_score(1, now=1000.0), score)
+        manager.on_block_freed(self.block(1))
+        for block_id in (-1, True, 1.0, "1", None):
+            with self.subTest(block_id=block_id):
+                with self.assertRaises(ValueError):
+                    manager.on_block_allocated(block_id)
+        self.assertEqual(manager.get_score_keys(1), keys)
+        self.assertEqual(manager.get_score(1, now=1000.0), score)
+        self.assertEqual(manager._index.size(), 1)
+        self.assertEqual(manager._index.pop_n(1, 0.0), [1])
+        self.clock.assert_not_called()
