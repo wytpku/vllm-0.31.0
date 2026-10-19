@@ -199,3 +199,140 @@ class TestMWFNativeRegistration(unittest.TestCase):
         manager.on_block_freed(block)
         self.assertIsInstance(manager._index, MWFCandidateIndex)
         self.assertEqual(manager._index.size(), 1)
+
+    def test_access_refresh_changes_native_priority_without_adding_candidates(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_freed(self.block(1))
+        self.clock.return_value = 1010.0
+        manager.on_block_cached(2, 64)
+        manager.on_block_freed(self.block(2))
+        self.clock.return_value = 1020.0
+        manager.on_block_accessed(1)
+        self.assertIsInstance(manager._index, MWFCandidateIndex)
+        self.assertEqual(manager._index.size(), 2)
+        self.assertLess(
+            manager.get_score(2, now=1020).weight,
+            manager.get_score(1, now=1020).weight,
+        )
+        self.assertEqual(manager._index.pop_n(2, 20.0), [2, 1])
+
+    def test_cached_content_refreshes_prefix_and_promotes_missing_candidate(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_cached(2, 128)
+        for block_id in (1, 2, 3):
+            manager.on_block_freed(self.block(block_id))
+        manager.on_block_cached(1, 20000)
+        manager.on_block_cached(3, 40000)
+        self.assertEqual(manager.get_score(1, now=1000).prefix_tokens, 20000)
+        self.assertEqual(manager.get_score(3, now=1000).prefix_tokens, 40000)
+        expected = sorted(
+            (1, 2, 3), key=lambda bid: manager.get_score(bid, now=1000).weight
+        )
+        self.assertEqual(expected, [2, 1, 3])
+        self.assertIsInstance(manager._index, MWFCandidateIndex)
+        self.assertEqual(manager._index.size(), 3)
+        self.assertEqual(manager._index.pop_n(3, 0.0), expected)
+
+    def test_record_updates_do_not_insert_blocks_without_free_candidates(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_freed(self.block(1))
+        held = self.block(2, ref_cnt=1)
+        manager.on_block_cached(held.block_id, 128)
+        self.clock.return_value = 1010.0
+        manager.on_block_accessed(held.block_id)
+        manager.on_block_accessed(3)
+        self.assertEqual(manager.get_score(2, now=1015).age_s, 5.0)
+        self.assertEqual(manager.get_score(2, now=1015).prefix_tokens, 128)
+        with self.assertRaises(KeyError):
+            manager.get_score(3, now=1015)
+        self.assertIsInstance(manager._index, MWFCandidateIndex)
+        self.assertEqual(manager._index.size(), 1)
+        self.assertEqual(manager._index.pop_n(1, 15.0), [1])
+
+    def test_failed_key_refresh_preserves_record_and_real_native_candidate(self):
+        for event in ("cached", "accessed"):
+            with self.subTest(event=event):
+                clock = Mock(return_value=1000.0)
+                manager = MWFEvictionManager(
+                    clock=clock,
+                    **(self.params | {"minexp_a": 0.0, "minexp_alpha": 5e-324}),
+                )
+                manager.on_block_cached(1, 64)
+                manager.on_block_freed(self.block(1))
+                keys = manager.get_score_keys(1)
+                score = manager.get_score(1, now=1000.0)
+                self.assertTrue(all(math.isfinite(key) for key in keys))
+                clock.return_value = 1001.0
+                with self.assertRaisesRegex(ValueError, "score keys must be finite"):
+                    if event == "cached":
+                        manager.on_block_cached(1, 128)
+                    else:
+                        manager.on_block_accessed(1)
+                self.assertEqual(manager.get_score_keys(1), keys)
+                self.assertEqual(manager.get_score(1, now=1000.0), score)
+                self.assertIsInstance(manager._index, MWFCandidateIndex)
+                self.assertEqual(manager._index.size(), 1)
+                self.assertEqual(manager._index.pop_n(1, 0.0), [1])
+
+    def test_reused_tracked_and_missing_keep_original_free_order(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_cached(4, 128)
+        for block in (self.block(1), self.block(2), self.block(3, None), self.block(4)):
+            manager.on_block_freed(block)
+        self.clock.reset_mock()
+        self.clock.side_effect = AssertionError("Reuse must not read the clock")
+        for block_id in (2, 1, 2, 1):
+            manager.on_block_reused(block_id)
+        for block_id in (1, 2):
+            with self.subTest(block_id=block_id):
+                with self.assertRaises(KeyError):
+                    manager.get_score(block_id, now=1000.0)
+                with self.assertRaises(KeyError):
+                    manager.get_score_keys(block_id)
+        self.assertIsInstance(manager._index, MWFCandidateIndex)
+        self.assertEqual(manager._index.size(), 4)
+        self.assertEqual(manager._index.pop_n(4, 0.0), [1, 2, 3, 4])
+        self.clock.assert_not_called()
+
+    def test_reused_non_candidate_clears_record_without_loading_or_adding(self):
+        for native_loaded in (False, True):
+            with self.subTest(native_loaded=native_loaded):
+                clock = Mock(return_value=1000.0)
+                manager = MWFEvictionManager(clock=clock, **self.params)
+                manager.on_block_cached(2, 64)
+                if native_loaded:
+                    manager.on_block_freed(self.block(1))
+                clock.reset_mock()
+                clock.side_effect = AssertionError("Reuse must not read the clock")
+                with patch("builtins.__import__", side_effect=AssertionError):
+                    manager.on_block_reused(2)
+                    manager.on_block_reused(2)
+                    manager.on_block_reused(3)
+                with self.assertRaises(KeyError):
+                    manager.get_score(2, now=1000.0)
+                with self.assertRaises(KeyError):
+                    manager.get_score_keys(2)
+                if native_loaded:
+                    self.assertEqual(manager._index.size(), 1)
+                    self.assertEqual(manager._index.pop_n(1, 0.0), [1])
+                else:
+                    self.assertIsNone(manager._index)
+                clock.assert_not_called()
+
+    def test_reused_invalid_ids_preserve_record_and_native_candidate(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_freed(self.block(1))
+        keys, score = manager.get_score_keys(1), manager.get_score(1, now=1000.0)
+        for block_id in (-1, True, 1.0, "1", None):
+            with self.subTest(block_id=block_id):
+                with self.assertRaises(ValueError):
+                    manager.on_block_reused(block_id)
+                self.assertEqual(manager.get_score_keys(1), keys)
+                self.assertEqual(manager.get_score(1, now=1000.0), score)
+                self.assertEqual(manager._index.size(), 1)
+        self.assertEqual(manager._index.pop_n(1, 0.0), [1])

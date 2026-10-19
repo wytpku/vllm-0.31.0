@@ -152,7 +152,9 @@ class MWFEvictionManager:
             raise ValueError("MWF timestamp must be finite")
         if now < self._time_origin:
             raise ValueError("MWF cache time must not precede time origin")
-        self._metadata[block_id] = _BlockMetadata(now, prefix_tokens)
+        updated = _BlockMetadata(now, prefix_tokens)
+        self._refresh_tracked_candidate(block_id, updated)
+        self._metadata[block_id] = updated
 
     def on_block_accessed(self, block_id: int) -> None:
         self._check_block_id(block_id)
@@ -165,7 +167,9 @@ class MWFEvictionManager:
             raise ValueError("MWF timestamp must be finite")
         if now < metadata.last_accessed:
             raise ValueError("MWF access time must not precede last access")
-        metadata.last_accessed = now
+        updated = _BlockMetadata(now, metadata.prefix_tokens)
+        self._refresh_tracked_candidate(block_id, updated)
+        self._metadata[block_id] = updated
 
     def get_score(self, block_id: int, *, now: float | None = None) -> MWFScore:
         self._check_block_id(block_id)
@@ -192,6 +196,9 @@ class MWFEvictionManager:
 
     def on_block_reused(self, block_id: int) -> None:
         self._check_block_id(block_id)
+        if self._index is not None:
+            assert self._kind is not None
+            self._index.update(block_id, self._kind.UNHASHED)
         self._metadata.pop(block_id, None)
 
     def _ensure_native(self) -> None:
@@ -226,3 +233,18 @@ class MWFEvictionManager:
             kind = self._kind.MISSING
 
         self._index.add(block.block_id, kind, key_a, key_b)
+
+    def _refresh_tracked_candidate(
+        self, block_id: int, metadata: _BlockMetadata
+    ) -> None:
+        if self._index is None:
+            return
+
+        key_a, key_b = compute_mwf_score_keys(
+            prefix_tokens=metadata.prefix_tokens,
+            last_accessed=metadata.last_accessed,
+            time_origin=self._time_origin,
+            **self._params,
+        )
+        assert self._kind is not None
+        self._index.update(block_id, self._kind.TRACKED, key_a, key_b)
