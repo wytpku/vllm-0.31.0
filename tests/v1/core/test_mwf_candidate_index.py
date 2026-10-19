@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from vllm._mwf_candidate_index import CandidateKind, MWFCandidateIndex
-from vllm.v1.core.mwf_eviction import MWFEvictionManager
+from vllm.v1.core.mwf_eviction import MWFEvictionManager, compute_mwf_score
 
 
 class TestMWFCandidateIndexBindings(unittest.TestCase):
@@ -396,3 +396,133 @@ class TestMWFNativeRegistration(unittest.TestCase):
         self.assertEqual(manager._index.size(), 1)
         self.assertEqual(manager._index.pop_n(1, 0.0), [1])
         self.clock.assert_not_called()
+
+    def test_reset_clears_all_kinds_and_reuses_native_index_for_new_content(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_cached(4, 128)
+        for block in (self.block(1), self.block(2), self.block(3, None)):
+            manager.on_block_freed(block)
+        index = manager._index
+        self.assertIsInstance(index, MWFCandidateIndex)
+        manager.reset()
+        manager.reset()
+        self.assertIs(manager._index, index)
+        self.assertEqual(index.size(), 0)
+        for block_id in (1, 4):
+            with self.subTest(block_id=block_id):
+                with self.assertRaises(KeyError):
+                    manager.get_score(block_id, now=1000.0)
+                with self.assertRaises(KeyError):
+                    manager.get_score_keys(block_id)
+        self.clock.return_value = 1010.0
+        manager.on_block_cached(1, 128)
+        manager.on_block_freed(self.block(1))
+        self.clock.return_value = 1020.0
+        manager.on_block_cached(5, 64)
+        manager.on_block_freed(self.block(5))
+        self.assertEqual(
+            manager.get_score(1, now=1030.0),
+            compute_mwf_score(
+                prefix_tokens=128, last_accessed=1010.0, now=1030.0, **self.params
+            ),
+        )
+        self.assertEqual(index.size(), 2)
+        self.assertEqual(index.pop_n(2, 30.0), [1, 5])
+
+    def test_resync_replaces_candidates_in_queue_order_and_preserves_records(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_cached(2, 64)
+        manager.on_block_freed(self.block(1))
+        old_index = manager._index
+        self.clock.return_value = 1010.0
+        for block_id in (5, 8, 99):
+            manager.on_block_cached(block_id, 128)
+        records = {
+            bid: (manager.get_score(bid, now=1020), manager.get_score_keys(bid))
+            for bid in (1, 8, 99)
+        }
+        blocks = [
+            self.block(5),
+            self.block(7, 0),
+            self.block(8, None),
+            self.block(2),
+            self.block(9, None),
+            self.block(6),
+        ]
+        self.clock.reset_mock()
+        self.clock.side_effect = AssertionError("Resync must not read the clock")
+        manager.resync(iter(blocks))
+        self.assertIsInstance(manager._index, MWFCandidateIndex)
+        self.assertIsNot(manager._index, old_index)
+        self.assertEqual(manager._index.size(), 6)
+        self.assertEqual(manager._index.pop_n(6, 20.0), [8, 9, 7, 6, 2, 5])
+        for bid, record in records.items():
+            self.assertEqual(
+                (manager.get_score(bid, now=1020), manager.get_score_keys(bid)), record
+            )
+        self.clock.assert_not_called()
+
+    def test_resync_empty_input_commits_empty_index_without_clearing_records(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_freed(self.block(1))
+        score, keys = manager.get_score(1, now=1000), manager.get_score_keys(1)
+        manager.resync(())
+        self.assertIsInstance(manager._index, MWFCandidateIndex)
+        self.assertEqual(manager._index.size(), 0)
+        self.assertEqual(manager.get_score(1, now=1000), score)
+        self.assertEqual(manager.get_score_keys(1), keys)
+
+    def test_resync_partial_build_failures_preserve_old_index_and_record(self):
+        manager = self.manager
+        manager.on_block_cached(1, 64)
+        manager.on_block_freed(self.block(1))
+        old_index = manager._index
+        score, keys = manager.get_score(1, now=1000), manager.get_score_keys(1)
+        temporary = self.block(9, None)
+
+        def interrupted():
+            yield temporary
+            raise RuntimeError("free queue iteration failed")
+
+        cases = [
+            ([temporary, temporary], ValueError),
+            ([temporary, self.block(True)], ValueError),
+            ([temporary, self.block(8, is_null=True)], ValueError),
+            ([temporary, self.block(8, ref_cnt=1)], ValueError),
+            ([temporary, self.block(8, ref_cnt=-1)], ValueError),
+            (interrupted(), RuntimeError),
+        ]
+        for position, (blocks, error) in enumerate(cases):
+            with self.subTest(case=position):
+                with self.assertRaises(error):
+                    manager.resync(blocks)
+                self.assertIs(manager._index, old_index)
+                self.assertEqual(old_index.size(), 1)
+                self.assertEqual(manager.get_score(1, now=1000), score)
+                self.assertEqual(manager.get_score_keys(1), keys)
+        self.assertEqual(old_index.pop_n(1, 0.0), [1])
+
+    def test_resync_bad_score_keys_preserve_old_candidates_and_metadata(self):
+        clock = Mock(return_value=1000.0)
+        manager = MWFEvictionManager(
+            clock=clock,
+            **(self.params | {"minexp_a": 0.0, "minexp_alpha": 5e-324}),
+        )
+        manager.on_block_cached(1, 64)
+        clock.return_value = 1001.0
+        manager.on_block_cached(2, 128)
+        manager.on_block_freed(self.block(1))
+        old_index = manager._index
+        score, keys = manager.get_score(1, now=1000), manager.get_score_keys(1)
+        invalid_record_score = manager.get_score(2, now=1001)
+        with self.assertRaisesRegex(ValueError, "score keys must be finite"):
+            manager.resync([self.block(9, None), self.block(2)])
+        self.assertIs(manager._index, old_index)
+        self.assertEqual(old_index.size(), 1)
+        self.assertEqual(manager.get_score(1, now=1000), score)
+        self.assertEqual(manager.get_score_keys(1), keys)
+        self.assertEqual(manager.get_score(2, now=1001), invalid_record_score)
+        self.assertEqual(old_index.pop_n(1, 0.0), [1])

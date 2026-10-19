@@ -1,7 +1,7 @@
 import math
 import time
 from dataclasses import dataclass
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 MWF_DELTA_SLOPE = 0.00043533405552524906
@@ -205,6 +205,37 @@ class MWFEvictionManager:
         self._check_block_id(block_id)
         if self._index is not None:
             self._index.erase(block_id)
+
+    def reset(self) -> None:
+        if self._index is not None:
+            self._index.clear()
+        self._metadata.clear()
+
+    def resync(self, free_blocks: Iterable['KVCacheBlock']) -> None:
+        from vllm._mwf_candidate_index import CandidateKind, MWFCandidateIndex
+
+        rebuilt = MWFCandidateIndex(
+            alpha=self._params["minexp_alpha"],
+            beta=self._params["minexp_beta"],
+        )
+        for block in free_blocks:
+            self._check_block_id(block.block_id)
+            if block.is_null or block.ref_cnt != 0:
+                raise ValueError(f"Block {block.block_id} is not a free candidate")
+
+            key_a = key_b = 0.0
+            if block.block_hash is None:
+                kind = CandidateKind.UNHASHED
+            elif block.block_id in self._metadata:
+                kind = CandidateKind.TRACKED
+                key_a, key_b = self.get_score_keys(block.block_id)
+            else:
+                kind = CandidateKind.MISSING
+
+            rebuilt.add(block.block_id, kind, key_a, key_b)
+
+        self._kind = CandidateKind
+        self._index = rebuilt
 
     def _ensure_native(self) -> None:
         if self._index is not None:

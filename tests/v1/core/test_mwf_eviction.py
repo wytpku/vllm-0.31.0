@@ -4,7 +4,7 @@
 import math
 import unittest
 from decimal import Decimal, localcontext
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from vllm.v1.core.mwf_eviction import (
     MWFEvictionManager,
@@ -438,3 +438,30 @@ class TestMWFMetadata(unittest.TestCase):
             manager.on_block_cached(1, 128)
         self.assertEqual(manager.get_score(1, now=1010.0), original)
         self.assertEqual(manager.get_score_keys(1), keys)
+
+    def test_reset_clears_records_without_loading_native_or_changing_origin(self):
+        clock = Mock(return_value=1000.0)
+        manager = MWFEvictionManager(clock=clock, **self.params())
+        manager.on_block_cached(1, 64)
+        clock.reset_mock()
+        clock.side_effect = AssertionError("Reset must not read the clock")
+        with patch("builtins.__import__", side_effect=AssertionError):
+            manager.reset()
+            manager.reset()
+        with self.assertRaises(KeyError):
+            manager.get_score(1, now=1000.0)
+        with self.assertRaises(KeyError):
+            manager.get_score_keys(1)
+        clock.assert_not_called()
+        clock.side_effect = None
+        clock.return_value = 1010.0
+        manager.on_block_cached(1, 128)
+        self.assertEqual(
+            manager.get_score_keys(1),
+            compute_mwf_score_keys(
+                prefix_tokens=128,
+                last_accessed=1010.0,
+                time_origin=1000.0,
+                **self.params(),
+            ),
+        )
