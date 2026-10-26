@@ -6,6 +6,7 @@ import unittest
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
 from typing import Annotated, Literal
+from unittest.mock import patch
 
 import pytest
 from pydantic import Field
@@ -653,6 +654,13 @@ class TestMWFEngineArgs(unittest.TestCase):
     """Keep MWF CLI values intact until CacheConfig validates them."""
 
     def setUp(self):
+        # CLI field checks do not need cached Hugging Face model snapshots.
+        self.enterContext(
+            patch(
+                "vllm.engine.arg_utils.get_model_path",
+                side_effect=lambda model, revision: model,
+            )
+        )
         self.parser = EngineArgs.add_cli_args(FlexibleArgumentParser(exit_on_error=False))
 
     def test_defaults_preserve_upstream_policy_and_original_parameters(self):

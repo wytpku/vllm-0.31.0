@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import contextmanager
 from typing import NamedTuple
 
 from vllm.logger import init_logger
@@ -14,7 +15,10 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     MambaManager,
+    MultiSegAllocationPlan,
+    MultiSegHitSnapshot,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -67,6 +71,25 @@ class KVCacheCoordinator(ABC):
     """Coordinate the KV cache of different KV cache groups."""
 
     enable_partial_hash_hits = False
+
+    def multiseg_manager(self) -> FullAttentionManager:
+        if (
+            len(self.single_type_managers) != 1
+            or type(self.single_type_managers[0]) is not FullAttentionManager
+        ):
+            raise NotImplementedError("MSA requires one FullAttention KV group")
+        return self.single_type_managers[0]
+
+    def plan_multiseg_blocks(
+        self, request: Request, num_tokens: int,
+        hits: Sequence[MultiSegHitSnapshot],
+    ) -> MultiSegAllocationPlan:
+        return self.multiseg_manager().plan_multiseg_blocks(request, num_tokens, hits)
+
+    @contextmanager
+    def allocate_multiseg_blocks(self, request: Request, plan: MultiSegAllocationPlan):
+        with self.multiseg_manager().allocate_multiseg_blocks(request, plan) as blocks:
+            yield (blocks,)
 
     def __init__(
         self,

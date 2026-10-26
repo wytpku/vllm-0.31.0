@@ -111,6 +111,16 @@ def source_manifest(repo: Path) -> dict:
     return {"files": files, "source_digest": hashlib.sha256(canonical).hexdigest()}
 
 
+def create_run_directory(root: Path, name: str | None) -> Path:
+    if name is None:
+        return Path(tempfile.mkdtemp(prefix="mwf-v0310-gate-", dir=root))
+    if not name or Path(name).name != name or name in (".", ".."):
+        raise ValueError("Run name must be a single directory name")
+    run = root / name
+    run.mkdir()
+    return run
+
+
 def child_environment(run: Path) -> dict[str, str]:
     env = os.environ.copy()
     directories = {
@@ -252,6 +262,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--result-root", type=Path, required=True)
+    parser.add_argument("--run-name", help="Fixed result directory name; must not exist")
     parser.add_argument(
         "--stage", choices=("inspect", "native", "package", "cpu", "gpu", "all"),
         default="inspect",
@@ -276,7 +287,7 @@ def main() -> int:
         0 <= args.rtol < float("inf")
     ):
         parser.error("Timeout must be positive; tolerances must be finite/nonnegative")
-    run = Path(tempfile.mkdtemp(prefix="mwf-v0310-gate-", dir=result_root))
+    run = create_run_directory(result_root, args.run_name)
     print(f"RESULT_DIR={run}", flush=True)
     manifest = source_manifest(repo)
     manifest.update(repo=str(repo), python=sys.executable, stage=args.stage)

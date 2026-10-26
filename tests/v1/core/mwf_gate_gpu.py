@@ -36,7 +36,7 @@ def write_json(path, value):
 
 
 def provenance(repo, policy):
-    names = ["vllm", "vllm._C", "vllm.v1.core.block_pool",
+    names = ["vllm", "vllm._C_stable_libtorch", "vllm.v1.core.block_pool",
              "vllm.v1.core.mwf_eviction", "vllm.v1.core.kv_cache_manager"]
     if policy == "mwf":
         names.append("vllm._mwf_candidate_index")

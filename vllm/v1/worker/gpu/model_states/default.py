@@ -192,7 +192,14 @@ class DefaultModelState(ModelState):
         query_start_loc_gpu = input_batch.query_start_loc[: num_reqs + 1]
         max_query_len = input_batch.max_query_len
         if max_query_len is None:
-            max_query_len = input_batch.num_scheduled_tokens.max().item()
+            if input_batch.query_layout is not None:
+                query_lens = (
+                    input_batch.query_start_loc_np[1:num_reqs + 1]
+                    - input_batch.query_start_loc_np[:num_reqs]
+                )
+                max_query_len = int(query_lens.max())
+            else:
+                max_query_len = input_batch.num_scheduled_tokens.max().item()
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         if for_capture:
             # Capture with worst-case max_seq_len so the graph is valid at any replay.
@@ -226,6 +233,10 @@ class DefaultModelState(ModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             dcp_local_seq_lens_cpu_upper_bound=input_batch.dcp_local_seq_lens_cpu_upper_bound,
             positions=input_batch.positions,
+            continuum_suffix_computed_block_locs=(
+                input_batch.continuum_suffix_computed_block_locs_np
+            ),
+            query_execution_plans=input_batch.query_execution_plans,
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,

@@ -15,8 +15,16 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    make_block_hash_with_group_id,
+    resolve_block_hashes,
+)
+from vllm.v1.core.single_type_kv_cache_manager import (
+    MambaManager,
+    MultiSegHitSnapshot,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -29,7 +37,13 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import (
+    Request,
+    RequestStatus,
+    decode_multi_segment_cache_locs,
+    encode_multi_segment_cache_locs,
+    reset_multi_segment_cache_state,
+)
 
 logger = init_logger(__name__)
 
@@ -160,6 +174,7 @@ class KVCacheManager:
         mwf_minexp_b: float = -19.15349,
         mwf_minexp_alpha: float = 1915.332,
         mwf_minexp_beta: float = 47.63942,
+        enable_multiseg_cache: bool = False,
     ) -> None:
         if prefix_cache_eviction_policy not in ("lru", "mwf"):
             raise ValueError(
@@ -263,6 +278,17 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        self.enable_multiseg_cache = enable_multiseg_cache
+        if enable_multiseg_cache:
+            manager = self.coordinator.multiseg_manager()
+            if use_eagle or num_prefill_lookahead or any(
+                group.is_eagle_group or group.host_resident
+                or group.role != KVCacheGroupRole.DEFAULT
+                for group in kv_cache_config.kv_cache_groups
+            ):
+                raise NotImplementedError("MSA requires an ordinary GPU cache group")
+            # Validate configuration even when the pool has no cache hits.
+            manager._check_multiseg_config()
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -312,6 +338,144 @@ class KVCacheManager:
         """Whether a local prefix cache lookup may be run for this request."""
         return self.enable_caching and not request.skip_reading_prefix_cache
 
+    def _publish_multiseg_metadata(self, request: Request, plan) -> None:
+        manager = self.coordinator.multiseg_manager()
+        block_size = manager.block_size
+        segments, first_start = decode_multi_segment_cache_locs(
+            request.continuum_suffix_computed_block_locs
+        )
+        hashes = resolve_block_hashes(
+            request.block_hashes, self.block_pool.hash_block_size, block_size
+        )
+        installed = manager.req_to_blocks[request.request_id]
+        reused = {hit.logical_index for hit in plan.hits
+                  if hit.logical_index * block_size >= first_start}
+        for begin, end in segments:
+            for index in range(begin // block_size, end // block_size):
+                if index < len(plan.owned_block_ids):
+                    expected = make_block_hash_with_group_id(
+                        hashes[index], manager.kv_cache_group_id
+                    )
+                    if self.block_pool.cached_block_hash_to_block.contain(
+                        expected, installed[index].block_id
+                    ):
+                        reused.add(index)
+        ranges = []
+        for index in sorted(reused):
+            if ranges and ranges[-1][1] == index * block_size:
+                ranges[-1] = (ranges[-1][0], (index + 1) * block_size)
+            else:
+                ranges.append((index * block_size, (index + 1) * block_size))
+        request.continuum_suffix_computed_block_locs = encode_multi_segment_cache_locs(
+            ranges, first_compute_start=first_start
+        )
+
+    def _allocate_multiseg_slots(
+        self, request: Request, num_new_tokens: int,
+        num_new_computed_tokens: int, new_computed_blocks: KVCacheBlocks | None,
+        *, num_lookahead_tokens: int, num_external_computed_tokens: int,
+        num_encoder_tokens: int, delay_cache_blocks: bool,
+        full_sequence_must_fit: bool, reserved_blocks: int, watermark_blocks: int,
+    ) -> KVCacheBlocks | None:
+        if num_lookahead_tokens or num_external_computed_tokens or num_encoder_tokens:
+            raise NotImplementedError(
+                "MSA does not support lookahead or external/encoder KV"
+            )
+        if request.num_in_flight_tokens:
+            raise NotImplementedError("MSA requires synchronous request progress")
+        if num_new_tokens < 0 or num_new_computed_tokens < 0 or reserved_blocks < 0:
+            raise ValueError(
+                "MSA token counts and reserved capacity must be nonnegative"
+            )
+        manager = self.coordinator.multiseg_manager()
+        owned = manager.req_to_blocks.get(request.request_id, ())
+        raw_hits = request.continuum_multiseg_cached_blocks
+        if any(not isinstance(hit, MultiSegHitSnapshot) for hit in raw_hits):
+            raise ValueError("MSA candidates must contain immutable identity snapshots")
+        if len({hit.logical_index for hit in raw_hits}) != len(raw_hits):
+            raise ValueError("Duplicate MSA candidate logical index")
+        if any(
+            not 0 <= hit.logical_index < cdiv(request.num_tokens, manager.block_size)
+            or not 0 <= hit.block_id < len(self.block_pool.blocks)
+            for hit in raw_hits
+        ):
+            raise ValueError("MSA candidate is outside the request or block pool")
+        candidates = {hit.logical_index: hit for hit in raw_hits
+                      if hit.logical_index >= len(owned)}
+        if new_computed_blocks is not None and len(new_computed_blocks.blocks) != 1:
+            raise ValueError("MSA prefix blocks require one KV group")
+        prefix = (
+            new_computed_blocks.blocks[0] if new_computed_blocks is not None else ()
+        )
+        if prefix and owned:
+            raise ValueError("Running MSA requests cannot acquire a new prefix")
+        if num_new_computed_tokens % manager.block_size:
+            raise NotImplementedError("MSA requires full-page prefix hits")
+        if len(prefix) != num_new_computed_tokens // manager.block_size:
+            raise ValueError("Prefix block count does not match computed tokens")
+        hashes = resolve_block_hashes(
+            request.block_hashes, self.block_pool.hash_block_size, manager.block_size
+        )
+        for index, block in enumerate(prefix):
+            if (
+                block.pool is not self.block_pool
+                or block.is_null
+                or block.ref_cnt < 0
+                or not 0 <= block.block_id < len(self.block_pool.blocks)
+                or self.block_pool.blocks[block.block_id] is not block
+            ):
+                raise ValueError("MSA prefix block must be canonical in this pool")
+            expected = make_block_hash_with_group_id(
+                hashes[index], manager.kv_cache_group_id
+            )
+            hit = MultiSegHitSnapshot(
+                index, block.block_id, expected, block.ref_cnt == 0
+            )
+            refreshed = manager._refresh_multiseg_hit(request, hit)
+            if refreshed is None:
+                raise ValueError("Prefix identity changed before MSA planning")
+            candidates[index] = refreshed
+        num_tokens = min(
+            request.num_computed_tokens + num_new_computed_tokens + num_new_tokens,
+            self.max_model_len,
+        )
+        hits = tuple(candidates.values())
+        if full_sequence_must_fit:
+            full = self.coordinator.plan_multiseg_blocks(
+                request, min(request.num_tokens, self.max_model_len), hits
+            )
+            if full.free_need + watermark_blocks > (
+                self.block_pool.get_num_free_blocks()
+            ):
+                return None
+        plan = self.coordinator.plan_multiseg_blocks(request, num_tokens, hits)
+        if plan.free_need + watermark_blocks > (
+            self.block_pool.get_num_free_blocks() - reserved_blocks
+        ):
+            return None
+        old_locs = request.continuum_suffix_computed_block_locs
+        try:
+            with self.coordinator.allocate_multiseg_blocks(request, plan) as blocks:
+                if num_new_computed_tokens:
+                    _, start = decode_multi_segment_cache_locs(old_locs)
+                    request.continuum_suffix_computed_block_locs = [
+                        max(
+                            start,
+                            request.num_computed_tokens + num_new_computed_tokens,
+                        )
+                    ]
+                self._publish_multiseg_metadata(request, plan)
+                result = self.create_kv_cache_blocks(blocks)
+                if not delay_cache_blocks:
+                    self.coordinator.cache_blocks(request, num_tokens)
+                if num_tokens >= request.num_tokens:
+                    request.continuum_multiseg_cached_blocks = None
+                return result
+        except BaseException:
+            request.continuum_suffix_computed_block_locs = old_locs
+            request.continuum_multiseg_cached_blocks = raw_hits
+            raise
+
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
         # Don't count a request that skipped the cache lookup.
         if not self.log_stats or not self.prefix_cache_lookup_enabled(request):
@@ -341,6 +505,8 @@ class KVCacheManager:
                   the junction and defeat cross-request reuse.
 
         """
+        if self.enable_multiseg_cache:
+            reset_multi_segment_cache_state(request)
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
@@ -360,6 +526,19 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if self.enable_multiseg_cache:
+            manager = self.coordinator.multiseg_manager()
+            num_new_computed_tokens -= num_new_computed_tokens % manager.block_size
+            computed_blocks = tuple(
+                list(blocks[: num_new_computed_tokens // manager.block_size])
+                for blocks in computed_blocks
+            )
+            request.continuum_multiseg_cached_blocks = (
+                manager.discover_multiseg_hits(request)
+            )
+            request.continuum_suffix_computed_block_locs = [
+                request.num_computed_tokens + num_new_computed_tokens
+            ]
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -574,6 +753,18 @@ class KVCacheManager:
         ):
             watermark_blocks = self.watermark_blocks
 
+        if (self.enable_multiseg_cache
+                and request.continuum_multiseg_cached_blocks is not None):
+            return self._allocate_multiseg_slots(
+                request, num_new_tokens, num_new_computed_tokens, new_computed_blocks,
+                num_lookahead_tokens=num_lookahead_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
+                num_encoder_tokens=num_encoder_tokens,
+                delay_cache_blocks=delay_cache_blocks,
+                full_sequence_must_fit=full_sequence_must_fit,
+                reserved_blocks=reserved_blocks, watermark_blocks=watermark_blocks,
+            )
+
         # Matches the scheduler's own prefill boundary: `num_tokens - 1`
         # extends it to resumed requests replaying their output tokens.
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
@@ -685,6 +876,8 @@ class KVCacheManager:
 
         """
         self.coordinator.free(request.request_id)
+        if self.enable_multiseg_cache:
+            reset_multi_segment_cache_state(request)
 
     def remove_skipped_blocks(
         self,

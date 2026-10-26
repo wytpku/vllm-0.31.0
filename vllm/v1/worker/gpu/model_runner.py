@@ -64,6 +64,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -112,6 +113,7 @@ from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
+    apply_msa_input_layout,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
     post_update,
@@ -162,7 +164,16 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
-from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.gpu.states import (
+    BatchQueryLayout,
+    QueryExecutionPlan,
+    RequestState,
+    build_batch_query_layout,
+    build_query_execution_plan,
+    get_uncached_query_ranges,
+    normalize_multi_segment_cache_locs,
+    pad_multi_segment_cache_locs,
+)
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchRunner,
@@ -1156,6 +1167,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                continuum_suffix_computed_block_locs=getattr(
+                    new_req_data, "continuum_suffix_computed_block_locs", None
+                ),
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
@@ -1209,6 +1223,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if req_new_block_ids is not None and req_id not in table_updates:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
+                )
+
+        suffix_rows = getattr(reqs, "continuum_suffix_computed_block_locs", None)
+        if suffix_rows:
+            if len(suffix_rows) != len(reqs.req_ids):
+                raise ValueError("MSA metadata does not match cached request IDs")
+            for req_id, row in zip(reqs.req_ids, suffix_rows):
+                req_index = self.req_states.req_id_to_index[req_id]
+                self.req_states.continuum_suffix_computed_block_locs[req_index] = (
+                    normalize_multi_segment_cache_locs(row)
                 )
 
         # Update CPU num_computed_prefill_tokens.
@@ -1314,6 +1338,174 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return batch_state, get_uniform_decode_token_count(
             num_reqs, num_toks, max_query_len, decode_graph_eligible
         )
+
+    def _check_msa_execution_gate(self, scheduler_output: SchedulerOutput) -> None:
+        """Reject compressed execution before request updates can write KV."""
+        rows = {
+            request.req_id: (
+                getattr(request, "continuum_suffix_computed_block_locs", None),
+                request.num_computed_tokens,
+            )
+            for request in scheduler_output.scheduled_new_reqs
+        }
+        cached = scheduler_output.scheduled_cached_reqs
+        cached_rows = getattr(cached, "continuum_suffix_computed_block_locs", None)
+        if len(cached.req_ids) != len(cached.num_computed_tokens):
+            raise ValueError("Cached request progress does not match request IDs")
+        if cached_rows:
+            if len(cached_rows) != len(cached.req_ids):
+                raise ValueError("MSA metadata does not match cached request IDs")
+        for offset, (req_id, start) in enumerate(zip(
+            cached.req_ids, cached.num_computed_tokens
+        )):
+            if cached_rows:
+                row = cached_rows[offset]
+            else:
+                index = self.req_states.req_id_to_index[req_id]
+                row = self.req_states.continuum_suffix_computed_block_locs[index]
+            rows[req_id] = (row, start)
+        for req_id, count in scheduler_output.num_scheduled_tokens.items():
+            if req_id in rows:
+                row, start = rows[req_id]
+            else:
+                index = self.req_states.req_id_to_index[req_id]
+                row = self.req_states.continuum_suffix_computed_block_locs[index]
+                start = int(self.req_states.num_computed_tokens_np[index])
+            canonical = normalize_multi_segment_cache_locs(row)
+            if int(start) < canonical[-1]:
+                raise ValueError("Logical progress precedes MSA compute start")
+            _, uncached_count = get_uncached_query_ranges(
+                canonical, int(start), int(count)
+            )
+            if uncached_count != count:
+                raise NotImplementedError(
+                    "MSA execution is disabled until attention execution is validated; "
+                    "use the controlled metadata preparation entry"
+                )
+
+    def prepare_query_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_req_state: "BatchReqState | None" = None,
+        *,
+        allow_msa: bool = False,
+    ) -> "PreparedQueryInputs":
+        """Build immutable logical/packed plans for a controlled metadata probe."""
+        if not isinstance(allow_msa, bool):
+            raise ValueError("allow_msa must be a bool")
+        if batch_req_state is None:
+            batch_req_state, _ = self.gather_batch_req_state(scheduler_output, False)
+        if batch_req_state is None:
+            raise ValueError("MSA preparation requires a real request batch")
+        if (
+            len(batch_req_state.req_ids) != len(batch_req_state.num_scheduled_tokens)
+            or len(batch_req_state.req_ids) != len(batch_req_state.idx_mapping_np)
+            or set(batch_req_state.req_ids) != set(
+                scheduler_output.num_scheduled_tokens
+            )
+            or any(
+                int(count) != scheduler_output.num_scheduled_tokens[req_id]
+                for req_id, count in zip(
+                    batch_req_state.req_ids, batch_req_state.num_scheduled_tokens
+                )
+            )
+        ):
+            raise ValueError("CPU batch state does not match logical scheduling")
+        suffix_rows = tuple(
+            tuple(normalize_multi_segment_cache_locs(
+                self.req_states.continuum_suffix_computed_block_locs[int(index)]
+            ))
+            for index in batch_req_state.idx_mapping_np
+        )
+        plans = []
+        for row, index, count in zip(
+            suffix_rows,
+            batch_req_state.idx_mapping_np,
+            batch_req_state.num_scheduled_tokens,
+        ):
+            start = int(self.req_states.num_computed_tokens_np[int(index)])
+            _, uncached_count = get_uncached_query_ranges(row, start, int(count))
+            if not allow_msa and uncached_count != count:
+                raise NotImplementedError("MSA execution remains disabled")
+            plans.append(build_query_execution_plan(
+                row, start, int(count), allow_msa=allow_msa
+            ))
+        frozen_plans = tuple(plans)
+        return PreparedQueryInputs(
+            batch_req_state, suffix_rows, frozen_plans,
+            build_batch_query_layout(frozen_plans),
+        )
+
+    def prepare_msa_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_req_state: "BatchReqState",
+        batch_desc: BatchExecutionDescriptor,
+    ) -> InputBatch:
+        """Prepare controlled MSA tensors; this entry never calls model forward."""
+        prepared = self.prepare_query_inputs(
+            scheduler_output, batch_req_state, allow_msa=True
+        )
+        if (
+            len(batch_req_state.req_ids) != 1
+            or not prepared.query_execution_plans[0].msa_enabled
+            or batch_desc.cg_mode != CUDAGraphMode.NONE
+            or batch_desc.num_ubatches != 1
+            or batch_desc.num_reqs not in (None, 1)
+            or self.scheduler_config.async_scheduling
+            or self.speculative_config is not None
+            or scheduler_output.scheduled_spec_decode_tokens
+            or not batch_req_state.has_prefill
+            or self.use_dcp or self.use_pp or self.pcp_manager is not None
+            or self.parallel_config.tensor_parallel_size != 1
+            or self.dp_size != 1 or self.lora_config is not None
+            or self.fast_prefill is not None or self.is_encoder_decoder
+            or self.pooling_runner is not None
+            or getattr(self.model_state, "supports_mm_inputs", False)
+            or getattr(self.model_state, "rope_state", None) is not None
+            or getattr(self.model_state, "prompt_embeds_state", None) is not None
+        ):
+            raise NotImplementedError(
+                "MSA metadata requires single-request synchronous eager text prefill"
+            )
+        groups = self.kv_cache_config.kv_cache_groups
+        if len(groups) != 1:
+            raise NotImplementedError("MSA metadata requires one KV cache group")
+        if groups[0].is_eagle_group or groups[0].host_resident:
+            raise NotImplementedError("MSA metadata requires a default GPU cache group")
+        spec = groups[0].kv_cache_spec
+        if (
+            type(spec) is not FullAttentionSpec
+            or spec.sliding_window is not None
+            or spec.attention_chunk_size is not None or spec.non_causal
+            or spec.head_size != 128
+            or spec.head_size_v != 128
+            or self.dtype not in (torch.float16, torch.bfloat16)
+            or self.kv_cache_dtype not in (torch.float16, torch.bfloat16)
+        ):
+            raise NotImplementedError(
+                "MSA metadata requires FP16/BF16 full attention with head size 128"
+            )
+        plan = prepared.query_execution_plans[0]
+        if plan.logical_end != int(batch_req_state.prefill_len_np[0]):
+            raise NotImplementedError("MSA currently requires finishing prefill")
+        if batch_desc.num_tokens < batch_req_state.num_tokens:
+            raise ValueError("Controlled input capacity must cover the logical batch")
+        if batch_desc.num_tokens > self.input_buffers.max_num_tokens:
+            raise ValueError("Controlled input capacity exceeds allocated buffers")
+        input_batch = self.prepare_inputs(
+            scheduler_output, batch_req_state, batch_desc, num_active_loras=0
+        )
+        request_index = int(batch_req_state.idx_mapping_np[0])
+        apply_msa_input_layout(
+            input_batch, self.input_buffers,
+            self.req_states.all_token_ids.gpu[request_index],
+            prepared.query_execution_plans, prepared.query_layout,
+        )
+        input_batch.continuum_suffix_computed_block_locs_np = (
+            pad_multi_segment_cache_locs(prepared.suffix_rows)
+        )
+        return input_batch
 
     def prepare_inputs(
         self,
@@ -1640,6 +1832,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
+        logical_seq_lens: torch.Tensor | None = None,
     ) -> None:
         # Update the number of computed tokens.
         output_bin_counts = None
@@ -1657,6 +1850,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            logical_seq_lens,
         )
 
         self.model_state.postprocess_state(
@@ -1685,6 +1879,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            self._check_msa_execution_gate(scheduler_output)
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -2179,6 +2374,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled,
             num_rejected,
             input_batch.query_start_loc,
+            logical_seq_lens=(
+                input_batch.seq_lens if input_batch.query_layout is not None else None
+            ),
         )
 
         if self.speculator is not None:
@@ -2294,6 +2492,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self.req_states.num_computed_tokens.gpu,
             input_batch.query_start_loc,
+            logical_seq_lens=(
+                input_batch.seq_lens if input_batch.query_layout is not None else None
+            ),
         )
 
     def shutdown(self) -> None:
@@ -2393,6 +2594,13 @@ class BatchReqState(NamedTuple):
     has_prefill: bool
     prefill_runs_as_decode_np: np.ndarray | None  # [num_reqs]
     decode_graph_eligible: bool
+
+
+class PreparedQueryInputs(NamedTuple):
+    batch_req_state: BatchReqState
+    suffix_rows: tuple[tuple[int, ...], ...]
+    query_execution_plans: tuple[QueryExecutionPlan, ...]
+    query_layout: BatchQueryLayout
 
 
 def sort_batch_req_ids(

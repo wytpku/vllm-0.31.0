@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.hisparse.runtime import HiSparseCacheHandle
+    from vllm.v1.worker.gpu.states import QueryExecutionPlan
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
         KVCacheLayout,
@@ -438,6 +439,10 @@ class CommonAttentionMetadata:
     has positions available so that builders can pre-compute position-dependent
     sparse metadata for DeepSeek V4 C128A layers."""
 
+    continuum_suffix_computed_block_locs: np.ndarray | None = None
+    """Canonical half-open cache ranges, right-padded with -1 per request."""
+    query_execution_plans: tuple["QueryExecutionPlan", ...] | None = None
+
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
@@ -488,8 +493,17 @@ class CommonAttentionMetadata:
     def compute_num_computed_tokens(self) -> torch.Tensor:
         """Compute num_computed_tokens on device (seq_lens - query_lens)."""
         if self._num_computed_tokens_cache is None:
-            query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
-            self._num_computed_tokens_cache = self.seq_lens - query_lens
+            if self.query_execution_plans is not None:
+                if len(self.query_execution_plans) != self.num_reqs:
+                    raise ValueError("Query plans do not match attention requests")
+                self._num_computed_tokens_cache = torch.tensor(
+                    [plan.logical_start for plan in self.query_execution_plans],
+                    dtype=self.seq_lens.dtype,
+                    device=self.seq_lens.device,
+                )
+            else:
+                query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
+                self._num_computed_tokens_cache = self.seq_lens - query_lens
         return self._num_computed_tokens_cache
 
     def token_to_req_indices(self, buffer: torch.Tensor) -> torch.Tensor:
@@ -553,6 +567,14 @@ class CommonAttentionMetadata:
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
+            positions=(
+                self.positions[:num_actual_tokens]
+                if self.positions is not None else None
+            ),
+            continuum_suffix_computed_block_locs=maybe_slice_reqs(
+                self.continuum_suffix_computed_block_locs
+            ),
+            query_execution_plans=maybe_slice_reqs(self.query_execution_plans),
         )
 
 

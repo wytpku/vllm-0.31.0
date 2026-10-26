@@ -4151,6 +4151,20 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        from vllm.v1.request import decode_multi_segment_cache_locs
+
+        rows = [
+            data.continuum_suffix_computed_block_locs
+            for data in scheduler_output.scheduled_new_reqs
+        ]
+        rows.extend(
+            scheduler_output.scheduled_cached_reqs.continuum_suffix_computed_block_locs
+        )
+        if any(row is not None and decode_multi_segment_cache_locs(row)[0]
+               for row in rows):
+            raise NotImplementedError(
+                "MSA compressed execution requires the controlled V2 metadata gate"
+            )
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "

@@ -43,6 +43,7 @@ from vllm.v1.worker.utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.states import QueryExecutionPlan
     from vllm.v1.worker.gpu.block_table import BlockTables
     from vllm.v1.worker.gpu.cudagraph_utils import (
         BatchExecutionDescriptor,
@@ -451,7 +452,11 @@ def build_attn_metadata(
     ubatch_idx: int = 0,
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
+    continuum_suffix_computed_block_locs: np.ndarray | None = None,
+    query_execution_plans: tuple["QueryExecutionPlan", ...] | None = None,
 ) -> dict[str, Any]:
+    if query_execution_plans is not None and len(query_execution_plans) != num_reqs:
+        raise ValueError("Query plans do not match attention requests")
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
@@ -510,6 +515,11 @@ def build_attn_metadata(
             dcp_local_seq_lens=dcp_local_seq_lens,
             dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
             positions=positions,
+            continuum_suffix_computed_block_locs=(
+                continuum_suffix_computed_block_locs[:num_reqs].copy()
+                if continuum_suffix_computed_block_locs is not None else None
+            ),
+            query_execution_plans=query_execution_plans,
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,

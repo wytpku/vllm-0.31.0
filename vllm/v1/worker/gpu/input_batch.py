@@ -14,6 +14,7 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
     from vllm.v1.worker.gpu.block_table import BlockTables
+    from vllm.v1.worker.gpu.states import BatchQueryLayout, QueryExecutionPlan
 
 
 class InputBuffers:
@@ -123,6 +124,10 @@ class InputBatch:
     # None if there are no prefills.
     prefill_runs_as_decode_np: np.ndarray | None = None
 
+    continuum_suffix_computed_block_locs_np: np.ndarray | None = None
+    query_execution_plans: tuple["QueryExecutionPlan", ...] | None = None
+    query_layout: "BatchQueryLayout | None" = None
+
     @classmethod
     def make_dummy(
         cls,
@@ -217,7 +222,98 @@ class InputBatch:
             has_structured_output_reqs=False,
             prompt_lens=None,
             max_query_len=max_query_len,
+            continuum_suffix_computed_block_locs_np=np.zeros(
+                (num_reqs, 1), dtype=np.int32
+            ),
         )
+
+
+def prepare_msa_prefill_inputs(
+    buffers: InputBuffers,
+    request_tokens: torch.Tensor,
+    plan: "QueryExecutionPlan",
+    prefill_len: int,
+) -> torch.Tensor:
+    """Gather one controlled MSA prefill in packed Q order."""
+    if not plan.msa_enabled or plan.logits_row is None:
+        raise ValueError("Expected an MSA plan with a final query token")
+    if plan.logical_end != prefill_len:
+        raise NotImplementedError("MSA currently requires finishing prefill")
+    count = plan.packed_q_count
+    if buffers.max_num_reqs < 1 or not 0 < count <= buffers.max_num_tokens:
+        raise ValueError("Invalid packed token count")
+    if request_tokens.ndim != 1 or request_tokens.shape[0] < plan.logical_end:
+        raise ValueError("Request tokens do not cover the logical query window")
+    if request_tokens.device != buffers.device:
+        raise ValueError("Request tokens and input buffers must share a device")
+    logical_positions = plan.logical_positions
+    if (
+        len(logical_positions) != count
+        or logical_positions[-1] != plan.logical_end - 1
+        or plan.logits_row != count - 1
+    ):
+        raise ValueError("MSA positions do not match the packed query plan")
+    positions = torch.tensor(
+        logical_positions, dtype=torch.int64, device=buffers.device
+    )
+    gathered = request_tokens.index_select(0, positions)
+    buffers.positions[:count].copy_(positions)
+    buffers.input_ids[:count].copy_(gathered)
+    buffers.seq_lens.zero_()
+    buffers.seq_lens[0] = plan.logical_end
+    return torch.tensor([plan.logits_row], dtype=torch.int64, device=buffers.device)
+
+
+def apply_msa_input_layout(
+    input_batch: InputBatch,
+    buffers: InputBuffers,
+    request_tokens: torch.Tensor,
+    plans: tuple["QueryExecutionPlan", ...],
+    layout: "BatchQueryLayout",
+) -> InputBatch:
+    """Replace controlled single-request inputs before building slot mappings."""
+    if (
+        input_batch.num_reqs != 1
+        or input_batch.num_reqs_after_padding != 1
+        or len(plans) != 1
+        or not plans[0].msa_enabled
+    ):
+        raise NotImplementedError("MSA inputs currently require one request")
+    plan = plans[0]
+    if (
+        layout.plans != plans
+        or layout.query_start_loc != (0, plan.packed_q_count)
+        or layout.logical_ends != (plan.logical_end,)
+        or layout.logits_indices != (plan.logits_row,)
+        or layout.num_actual_tokens != plan.packed_q_count
+    ):
+        raise ValueError("MSA plan and packed layout disagree")
+    if not (
+        plan.packed_q_count <= input_batch.num_tokens_after_padding
+        <= buffers.max_num_tokens
+    ):
+        raise ValueError("Packed query exceeds input batch capacity")
+    logits = prepare_msa_prefill_inputs(
+        buffers, request_tokens, plan, int(input_batch.prefill_len_np[0])
+    )
+    count = layout.num_actual_tokens
+    query_starts = np.asarray(layout.query_start_loc, dtype=np.int32)
+    buffers.query_start_loc[0] = 0
+    buffers.query_start_loc[1:] = count
+    buffers.is_padding[:count] = False
+    buffers.is_padding[count:input_batch.num_tokens_after_padding] = True
+    input_batch.num_tokens = count
+    input_batch.query_start_loc_np = query_starts.copy()
+    input_batch.query_start_loc = buffers.query_start_loc[:2]
+    input_batch.seq_lens = buffers.seq_lens[:1]
+    input_batch.seq_lens_cpu_upper_bound = torch.tensor(
+        layout.logical_ends, dtype=torch.int32
+    )
+    input_batch.logits_indices = logits
+    input_batch.max_query_len = count
+    input_batch.query_execution_plans = plans
+    input_batch.query_layout = layout
+    return input_batch
 
 
 def set_dummy_context(
@@ -567,6 +663,7 @@ def _post_update_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    logical_seq_lens_ptr,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
@@ -607,10 +704,15 @@ def _post_update_kernel(
         query_len = query_end - query_start
     num_rejected = tl.load(num_rejected_ptr + req_id)
 
-    computed_delta = query_len - num_rejected
-    if computed_delta != 0:
+    if logical_seq_lens_ptr is not None:
+        logical_end = tl.load(logical_seq_lens_ptr + req_id)
+        tl.store(num_computed_tokens_ptr + req_state_idx, logical_end - num_rejected)
+    elif query_len - num_rejected != 0:
         num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
-        tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
+        tl.store(
+            num_computed_tokens_ptr + req_state_idx,
+            num_computed + query_len - num_rejected,
+        )
 
 
 def post_update(
@@ -634,6 +736,7 @@ def post_update(
     all_token_ids: torch.Tensor,
     # [max_num_reqs]
     total_len: torch.Tensor,
+    logical_seq_lens: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     _post_update_kernel[(num_reqs,)](
@@ -650,6 +753,7 @@ def post_update(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        logical_seq_lens,
         num_warps=1,
     )
 
@@ -659,6 +763,7 @@ def _post_update_num_computed_tokens_kernel(
     idx_mapping_ptr,
     num_computed_tokens_ptr,
     query_start_loc_ptr,
+    logical_seq_lens_ptr,
 ):
     batch_id = tl.program_id(0)
     query_start = tl.load(query_start_loc_ptr + batch_id)
@@ -666,8 +771,11 @@ def _post_update_num_computed_tokens_kernel(
     query_len = query_end - query_start
 
     req_state_idx = tl.load(idx_mapping_ptr + batch_id)
-    num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
-    tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + query_len)
+    if logical_seq_lens_ptr is not None:
+        num_computed = tl.load(logical_seq_lens_ptr + batch_id)
+    else:
+        num_computed = tl.load(num_computed_tokens_ptr + req_state_idx) + query_len
+    tl.store(num_computed_tokens_ptr + req_state_idx, num_computed)
 
 
 def post_update_num_computed_tokens(
@@ -677,12 +785,14 @@ def post_update_num_computed_tokens(
     num_computed_tokens: torch.Tensor,
     # [num_reqs + 1]
     query_start_loc: torch.Tensor,
+    logical_seq_lens: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     _post_update_num_computed_tokens_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,
         query_start_loc,
+        logical_seq_lens,
     )
 
 

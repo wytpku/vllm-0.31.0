@@ -182,7 +182,6 @@ def collect_environment(repo: Path) -> dict:
 
     for name, relative in {
         "vllm": "vllm/__init__.py",
-        "vllm._C": None,
         "vllm._C_stable_libtorch": None,
         "vllm._mwf_candidate_index": None,
         "vllm.v1.core.block_pool": "vllm/v1/core/block_pool.py",

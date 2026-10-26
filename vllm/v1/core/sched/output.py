@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -54,6 +54,7 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    continuum_suffix_computed_block_locs: list[int] | None = None
 
     @classmethod
     def from_request(
@@ -80,6 +81,9 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            continuum_suffix_computed_block_locs=(
+                getattr(request, "continuum_suffix_computed_block_locs", [0]).copy()
+            ),
         )
 
     @property
@@ -150,6 +154,9 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    continuum_suffix_computed_block_locs: list[list[int] | None] = field(
+        default_factory=list
+    )
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:

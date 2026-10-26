@@ -1682,6 +1682,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        continuum_suffix_computed_block_locs: list[list[int] | None] = []
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1713,6 +1714,9 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )
             num_computed_tokens.append(req.num_computed_tokens)
+            continuum_suffix_computed_block_locs.append(
+                req.continuum_suffix_computed_block_locs.copy()
+            )
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
@@ -1725,6 +1729,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            continuum_suffix_computed_block_locs=continuum_suffix_computed_block_locs,
         )
 
     def _reject_on_encoder_cache_embed_mismatch(

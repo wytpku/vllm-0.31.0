@@ -4,8 +4,9 @@
 import enum
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -28,6 +29,62 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.core.single_type_kv_cache_manager import MultiSegHitSnapshot
+
+
+MultiSegmentCacheSegment = tuple[int, int]
+
+
+def _cache_location_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError("cache locations must be integers")
+    return int(value)
+
+
+def encode_multi_segment_cache_locs(
+    segments: Sequence[MultiSegmentCacheSegment],
+    first_compute_start: int,
+) -> list[int]:
+    """Encode ordered half-open cached ranges followed by the compute start."""
+    first_compute_start = _cache_location_int(first_compute_start)
+    if first_compute_start < 0:
+        raise ValueError("first_compute_start must be non-negative")
+    encoded: list[int] = []
+    previous_end = first_compute_start
+    for begin, end in segments:
+        begin, end = _cache_location_int(begin), _cache_location_int(end)
+        if begin < previous_end or end <= begin:
+            raise ValueError("cache segments must be ordered and non-overlapping")
+        encoded.extend((begin, end))
+        previous_end = end
+    encoded.append(first_compute_start)
+    return encoded
+
+
+def decode_multi_segment_cache_locs(
+    locs: Sequence[int],
+) -> tuple[list[MultiSegmentCacheSegment], int]:
+    """Decode cached ranges, accepting the old zero-length [0, 0] marker."""
+    if len(locs) == 0 or len(locs) % 2 == 0:
+        raise ValueError("multi-segment cache metadata must have odd length")
+    values = [_cache_location_int(value) for value in locs]
+    first_compute_start = values[-1]
+    segments = [
+        (values[index], values[index + 1])
+        for index in range(0, len(values) - 1, 2)
+        if (values[index], values[index + 1]) != (0, 0)
+    ]
+    encode_multi_segment_cache_locs(segments, first_compute_start)
+    return segments, first_compute_start
+
+
+def reset_multi_segment_cache_state(
+    request: Any, first_compute_start: int = 0
+) -> None:
+    request.continuum_suffix_computed_block_locs = encode_multi_segment_cache_locs(
+        (), first_compute_start
+    )
+    request.continuum_multiseg_cached_blocks = None
 
 
 @dataclass
@@ -183,6 +240,11 @@ class Request:
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
+
+        self.continuum_suffix_computed_block_locs: list[int] = [0]
+        self.continuum_multiseg_cached_blocks: (
+            tuple["MultiSegHitSnapshot", ...] | None
+        ) = None
 
         # Multi-modal related
         self.mm_features = mm_features or []

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import contextmanager
+from copy import copy
 from itertools import islice
 from typing import TYPE_CHECKING, Any
 
@@ -199,6 +201,72 @@ class BlockPool:
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
         self.mwf_eviction_manager: "MWFEvictionManager | None" = None
+        self._msa_rollback_failed = False
+
+    def _check_msa_pool_state(self) -> None:
+        if self._msa_rollback_failed:
+            raise RuntimeError("MSA rollback failed; recreate the block pool")
+
+    @contextmanager
+    def multiseg_transaction(self):
+        """Restore a controlled MSA installation, including cache identities.
+
+        The synchronous metadata gate uses a full pool snapshot. External
+        observers are rejected because their side effects cannot be undone.
+        No model or KV tensor writes may occur inside this scope.
+        """
+        self._check_msa_pool_state()
+        if self.metrics_collector is not None or self._reuse_watchers:
+            raise NotImplementedError("MSA transactions require no external observers")
+        saved_blocks = [
+            (block.ref_cnt, block.block_hash, block.block_hash_num_tokens)
+            for block in self.blocks
+        ]
+        free_before = self.free_block_queue.get_all_free_blocks()
+        buckets = {
+            key: (value, value.copy() if isinstance(value, dict) else None)
+            for key, value in self.cached_block_hash_to_block._cache.items()
+        }
+        aliases = {key: value.copy() for key, value in
+                   self.cached_block_hashes_by_block.items()}
+        events = self.kv_event_queue.copy()
+        mwf = self.mwf_eviction_manager
+        mwf_metadata = (
+            {key: copy(value) for key, value in mwf._metadata.items()}
+            if mwf is not None else None
+        )
+        try:
+            yield
+        except BaseException:
+            try:
+                for block, (refs, key, boundary) in zip(
+                    self.blocks, saved_blocks, strict=True
+                ):
+                    block.ref_cnt = refs
+                    block._block_hash = key
+                    block._block_hash_num_tokens = boundary
+                    block.prev_free_block = block.next_free_block = None
+                self.free_block_queue.__init__(free_before)
+                cache = self.cached_block_hash_to_block._cache
+                cache.clear()
+                for key, (value, contents) in buckets.items():
+                    if isinstance(value, dict):
+                        value.clear()
+                        value.update(contents)
+                    cache[key] = value
+                self.cached_block_hashes_by_block.clear()
+                self.cached_block_hashes_by_block.update(aliases)
+                self.kv_event_queue[:] = events
+                if mwf is not None:
+                    mwf._metadata.clear()
+                    mwf._metadata.update(mwf_metadata)
+                    mwf.resync(free_before)
+            except BaseException as rollback_error:
+                self._msa_rollback_failed = True
+                raise RuntimeError(
+                    "MSA rollback failed; recreate the block pool"
+                ) from rollback_error
+            raise
 
     def enable_mwf_eviction(
         self,
@@ -787,6 +855,7 @@ class BlockPool:
             A list of new block.
 
         """
+        self._check_msa_pool_state()
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
@@ -908,6 +977,7 @@ class BlockPool:
             blocks: A list of blocks to touch.
 
         """
+        self._check_msa_pool_state()
         if self.mwf_eviction_manager is not None:
             self._touch_mwf(blocks)
             return
@@ -964,6 +1034,7 @@ class BlockPool:
                 priority.
 
         """
+        self._check_msa_pool_state()
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []

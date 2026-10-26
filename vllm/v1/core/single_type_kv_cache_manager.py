@@ -4,6 +4,8 @@ import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 from vllm.distributed.kv_events import MEDIUM_CPU
@@ -15,6 +17,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
+    make_block_hash_with_group_id,
     resolve_block_hashes,
 )
 from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
@@ -46,6 +49,74 @@ if TYPE_CHECKING:
     from vllm.v1.hisparse.coordinator import HiSparseCoordinator
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class MultiSegHitSnapshot:
+    logical_index: int
+    block_id: int
+    expected_hash_with_group: BlockHashWithGroupId
+    is_free: bool
+
+
+@dataclass(frozen=True)
+class MultiSegAllocationPlan:
+    block_ids: tuple[int | None, ...]
+    hits: tuple[MultiSegHitSnapshot, ...]
+    owned_block_ids: tuple[int, ...]
+    num_tokens: int
+
+    @property
+    def holes(self) -> tuple[int, ...]:
+        return tuple(
+            i for i, block_id in enumerate(self.block_ids)
+            if block_id is None
+        )
+
+    @property
+    def acquire_block_ids(self) -> tuple[int, ...]:
+        return tuple(hit.block_id for hit in self.hits)
+
+    @property
+    def free_need(self) -> int:
+        free_hits = {hit.block_id for hit in self.hits if hit.is_free}
+        return len(self.holes) + len(free_hits)
+
+def plan_multiseg_allocation(
+    num_tokens: int,
+    block_size: int,
+    owned_block_ids: tuple[int, ...],
+    hits: tuple[MultiSegHitSnapshot, ...],
+) -> MultiSegAllocationPlan:
+    if block_size <= 0 or num_tokens < 0:
+        raise ValueError("Invalid token count or block size")
+
+    num_blocks = cdiv(num_tokens, block_size)
+    owned_block_ids, hits = tuple(owned_block_ids), tuple(hits)
+    if len(owned_block_ids) > num_blocks or any(
+        block_id < 0 for block_id in owned_block_ids
+    ):
+        raise ValueError("Invalid owned block prefix")
+
+    layout: list[int | None] = list(owned_block_ids)
+    layout.extend([None] * (num_blocks - len(layout)))
+    free_states = dict.fromkeys(owned_block_ids, False)
+
+    for hit in hits:
+        index = hit.logical_index
+        if not len(owned_block_ids) <= index < num_tokens // block_size:
+            raise ValueError("Hit overlaps owned prefix or incomplete tail")
+        if hit.block_id < 0 or layout[index] is not None:
+            raise ValueError("Invalid block ID or duplicate logical hit")
+        previous = free_states.setdefault(hit.block_id, hit.is_free)
+        if previous != hit.is_free:
+            raise ValueError("Inconsistent physical-block snapshot")
+        layout[index] = hit.block_id
+
+    return MultiSegAllocationPlan(
+        block_ids=tuple(layout), hits=hits,
+        owned_block_ids=owned_block_ids, num_tokens=num_tokens,
+    )
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -148,6 +219,7 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        self._multiseg_requests: set[str] = set()
         # Boundary-state offload hand-off for external KV connectors. A mamba
         # "align" block table is not append-only (interior states are
         # nulled/freed and speculative blocks relocate in place), so a
@@ -576,6 +648,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self._multiseg_requests.discard(request_id)
         return req_blocks
 
     def free(self, request_id: str) -> None:
@@ -744,6 +817,202 @@ class SingleTypeKVCacheManager(ABC):
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
+    def _check_multiseg_config(self) -> None:
+        spec = self.kv_cache_spec
+        if (
+            not self.enable_caching
+            or not self.block_pool.enable_caching
+            or type(spec) is not FullAttentionSpec
+            or spec.sliding_window is not None
+            or spec.attention_chunk_size is not None
+            or spec.non_causal
+            or self.dcp_world_size != 1
+            or self.pcp_world_size != 1
+            or self.use_eagle
+        ):
+            raise NotImplementedError(
+                "MSA requires prefix caching and ordinary causal FullAttention"
+            )
+
+    def discover_multiseg_hits(
+        self, request: Request,
+    ) -> tuple[MultiSegHitSnapshot, ...]:
+        """Discover full-page identities without reserving any references."""
+        self._check_multiseg_config()
+        hashes = resolve_block_hashes(
+            request.block_hashes, self.block_pool.hash_block_size, self.block_size
+        )
+        limit = min(len(hashes), max(request.num_tokens - 1, 0) // self.block_size)
+        hits = []
+        for index in range(limit):
+            expected = make_block_hash_with_group_id(
+                hashes[index], self.kv_cache_group_id
+            )
+            block = self.block_pool.cached_block_hash_to_block.get_one_block(expected)
+            if block is None:
+                continue
+            hit = MultiSegHitSnapshot(
+                index, block.block_id, expected, block.ref_cnt == 0
+            )
+            refreshed = self._refresh_multiseg_hit(request, hit)
+            if refreshed is not None:
+                hits.append(refreshed)
+        return tuple(hits)
+
+    @contextmanager
+    def allocate_multiseg_blocks(self, request: Request, plan: MultiSegAllocationPlan):
+        """Install a plan; metadata/cache publication belongs inside the scope."""
+        plan = self._refresh_multiseg_plan(request, plan)
+        pool = self.block_pool
+        if plan.free_need > pool.get_num_free_blocks():
+            raise ValueError("Insufficient free blocks for MSA allocation")
+        request_id = request.request_id
+        old_table = self.req_to_blocks.get(request_id)
+        old_blocks = tuple(old_table) if old_table is not None else ()
+        had_cached = request_id in self.num_cached_block
+        cached_before = self.num_cached_block.get(request_id)
+        ids = self.new_block_ids
+        ids_before = ids.copy()
+        was_multiseg = request_id in self._multiseg_requests
+        with pool.multiseg_transaction():
+            try:
+                for block_id in plan.acquire_block_ids:
+                    pool.touch([pool.blocks[block_id]])
+                allocated = pool.get_new_blocks(len(plan.holes))
+                layout = list(plan.block_ids)
+                for index, block in zip(plan.holes, allocated, strict=True):
+                    layout[index] = block.block_id
+                if any(block_id is None for block_id in layout):
+                    raise RuntimeError("MSA allocation left an unfilled logical slot")
+                final = [pool.blocks[block_id] for block_id in layout
+                         if block_id is not None]
+                if old_table is None:
+                    self.req_to_blocks[request_id] = final
+                else:
+                    old_table[:] = final
+                self.num_cached_block.setdefault(request_id, 0)
+                self._multiseg_requests.add(request_id)
+                if self._record_new_block_ids:
+                    ids.extend(block.block_id for block in allocated)
+                yield final[len(old_blocks):]
+            except BaseException:
+                if old_table is None:
+                    self.req_to_blocks.pop(request_id, None)
+                else:
+                    old_table[:] = old_blocks
+                    self.req_to_blocks[request_id] = old_table
+                if had_cached:
+                    self.num_cached_block[request_id] = cached_before
+                else:
+                    self.num_cached_block.pop(request_id, None)
+                ids[:] = ids_before
+                self.new_block_ids = ids
+                if not was_multiseg:
+                    self._multiseg_requests.discard(request_id)
+                raise
+
+    def _refresh_multiseg_plan(
+        self,
+        request: Request,
+        plan: MultiSegAllocationPlan,
+    ) -> MultiSegAllocationPlan:
+        """Revalidate a plan before acquiring any block references."""
+        owned_now = tuple(
+            block.block_id
+            for block in self.req_to_blocks.get(request.request_id, ())
+        )
+        if owned_now != plan.owned_block_ids:
+            raise ValueError("Request block table changed; rebuild the MSA plan")
+
+        refreshed = self.plan_multiseg_blocks(
+            request, plan.num_tokens, plan.hits
+        )
+        if refreshed.block_ids != plan.block_ids:
+            raise ValueError("MSA candidates changed; rebuild the plan")
+
+        return refreshed
+
+    def _refresh_multiseg_hit(
+        self, request: Request, hit: MultiSegHitSnapshot,
+    ) -> MultiSegHitSnapshot | None:
+        self._check_multiseg_config()
+        pool = self.block_pool
+        block_hashes = resolve_block_hashes(
+            request.block_hashes, pool.hash_block_size, self.block_size
+        )
+        limit = min(
+            len(block_hashes), max(request.num_tokens - 1, 0) // self.block_size
+        )
+        index = hit.logical_index
+        if not 0 <= index < limit or not 0 <= hit.block_id < len(pool.blocks):
+            return None
+
+        expected = make_block_hash_with_group_id(
+            block_hashes[index], self.kv_cache_group_id
+        )
+        block = pool.blocks[hit.block_id]
+        if (
+            expected != hit.expected_hash_with_group
+            or block.pool is not pool
+            or block.is_null
+            or block.ref_cnt < 0
+            or not pool.cached_block_hash_to_block.contain(expected, hit.block_id)
+        ):
+            return None
+
+        return MultiSegHitSnapshot(index, hit.block_id, expected, block.ref_cnt == 0)
+
+    def plan_multiseg_blocks(
+        self, request: Request, num_tokens: int,
+        hits: Sequence[MultiSegHitSnapshot],
+    ) -> MultiSegAllocationPlan:
+        self._check_multiseg_config()
+        pool = self.block_pool
+
+        if not 0 <= num_tokens <= request.num_tokens:
+            raise ValueError("Invalid allocation window")
+        if request.request_id in self._partial_hit_reqs:
+            raise NotImplementedError("MSA does not support partial-hit CoW")
+
+        owned = tuple(self.req_to_blocks.get(request.request_id, ()))
+        if len(owned) > cdiv(num_tokens, self.block_size):
+            raise ValueError("Owned table exceeds allocation window")
+        for block in owned:
+            if (
+                block.pool is not pool
+                or block.is_null
+                or block.ref_cnt <= 0
+                or not 0 <= block.block_id < len(pool.blocks)
+                or pool.blocks[block.block_id] is not block
+            ):
+                raise ValueError("Invalid owned block")
+
+        seen: set[int] = set()
+        refreshed_hits: list[MultiSegHitSnapshot] = []
+        request_blocks = cdiv(request.num_tokens, self.block_size)
+        for hit in hits:
+            index = hit.logical_index
+            if (
+                not len(owned) <= index < request_blocks
+                or index in seen
+                or not 0 <= hit.block_id < len(pool.blocks)
+            ):
+                raise ValueError("Invalid candidate layout")
+            seen.add(index)
+
+            if index >= num_tokens // self.block_size:
+                continue
+            refreshed = self._refresh_multiseg_hit(request, hit)
+            if refreshed is not None:
+                refreshed_hits.append(refreshed)
+
+        return plan_multiseg_allocation(
+            num_tokens,
+            self.block_size,
+            tuple(block.block_id for block in owned),
+            tuple(refreshed_hits),
+        )
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -850,6 +1119,32 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
+        if request.request_id in self._multiseg_requests:
+            hashes = resolve_block_hashes(
+                request.block_hashes, self.block_pool.hash_block_size, self.block_size
+            )
+            start = self.num_cached_block.get(request.request_id, 0)
+            end = num_tokens // self.block_size
+            blocks = self.req_to_blocks[request.request_id]
+            for index in range(start, end):
+                block = blocks[index]
+                expected = make_block_hash_with_group_id(
+                    hashes[index], self.kv_cache_group_id
+                )
+                if self.block_pool.cached_block_hash_to_block.contain(
+                    expected, block.block_id
+                ):
+                    continue
+                if block.block_hash is not None:
+                    raise ValueError(
+                        "MSA installed block has an unexpected cache identity"
+                    )
+                self.block_pool.cache_full_blocks(
+                    request, blocks, index, index + 1,
+                    self.block_size, self.kv_cache_group_id,
+                )
+            self.num_cached_block[request.request_id] = end
+            return
         super().cache_blocks(
             request,
             num_tokens,

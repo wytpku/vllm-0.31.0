@@ -11,6 +11,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 RUNNER = Path(__file__).with_name("run_mwf_gate.py")
@@ -20,7 +22,12 @@ if SPEC is None or SPEC.loader is None:
 gate = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = gate
 SPEC.loader.exec_module(gate)
-RESULTS_ROOT = Path(__file__).resolve().parents[3].parent / "mwf gate"
+RESULTS_ROOT = Path(
+    os.environ.get(
+        "MWF_GATE_TEST_ROOT",
+        str(Path(__file__).resolve().parents[3].parent / "mwf gate"),
+    )
+)
 
 
 class TestMWFGate(unittest.TestCase):
@@ -45,6 +52,17 @@ class TestMWFGate(unittest.TestCase):
         expected = self.results.resolve()
         self.assertEqual(gate.validate_result_root(self.results), expected)
         self.assertEqual(gate.validate_result_root(alias), expected)
+
+    def test_fixed_run_name_preserves_existing_evidence(self):
+        run = gate.create_run_directory(self.results, "gate")
+        marker = run / "summary.json"
+        marker.write_text("original evidence")
+        with self.assertRaises(FileExistsError):
+            gate.create_run_directory(self.results, "gate")
+        self.assertEqual(marker.read_text(), "original evidence")
+        for name in ("", ".", "..", "../outside", "/absolute", "nested/run"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                gate.create_run_directory(self.results, name)
 
     def test_result_root_rejects_missing_files_and_temporary_locations(self):
         temporary_alias = self.folder / "temporary-alias"
@@ -87,6 +105,37 @@ class TestMWFGate(unittest.TestCase):
         (linked_repo / "vllm").symlink_to(self.package, target_is_directory=True)
         with self.assertRaises(ValueError):
             gate.require_origin(self.origin, linked_repo)
+
+    def test_gpu_provenance_requires_current_cuda_binary_without_legacy_module(self):
+        path = RUNNER.with_name("mwf_gate_gpu.py")
+        spec = importlib.util.spec_from_file_location("mwf_gate_gpu_tests", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load GPU gate worker: {path}")
+        worker = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"run_mwf_gate": gate}):
+            spec.loader.exec_module(worker)
+        extension = self.package / "_C_stable_libtorch.abi3.so"
+        extension.write_bytes(b"CUDA extension provenance fixture")
+        binary = extension
+
+        def import_module(name):
+            if name == "vllm._C" or (
+                name == "vllm._C_stable_libtorch" and binary is None
+            ):
+                raise ModuleNotFoundError(name)
+            origin = binary if name == "vllm._C_stable_libtorch" else self.origin
+            return SimpleNamespace(__file__=str(origin))
+
+        with patch.object(worker.importlib, "import_module", side_effect=import_module):
+            modules = worker.provenance(self.repo, "lru")
+            self.assertEqual(
+                modules["vllm._C_stable_libtorch"],
+                {"path": str(extension.resolve()), "sha256": gate.sha256(extension)},
+            )
+            for binary, error in ((None, ModuleNotFoundError), (RUNNER, ValueError)):
+                with self.subTest(binary=binary):
+                    with self.assertRaises(error):
+                        worker.provenance(self.repo, "lru")
 
     def test_success_reports_only_requested_scope_and_keeps_gpu_not_run(self):
         names = ["inspect", "native", "package"]

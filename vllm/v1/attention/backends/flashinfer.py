@@ -5,7 +5,7 @@
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
@@ -88,12 +88,16 @@ from vllm.v1.attention.ops.dcp import (
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    FullAttentionSpec,
     KVCacheLayout,
     KVCacheSpec,
     KVQuantMode,
     iter_layer_specs,
 )
 from vllm.v1.utils import CpuGpuBuffer
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.states import QueryExecutionPlan
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
@@ -642,6 +646,18 @@ class FlashInferTrtllmAPIDecode:
     """Decode query boundaries for masking empty DCP shards during reduction."""
 
 
+@dataclass(frozen=True)
+class FlashInferMSACall:
+    """One packed query interval with an independent FlashInfer plan."""
+
+    wrapper: BatchPrefillWithPagedKVCacheWrapper
+    q_slice: slice
+    kv_len: int
+    page_ids: torch.Tensor
+    workspace: torch.Tensor
+    plan_buffers: tuple[torch.Tensor, ...]
+
+
 @dataclass
 class FlashInferMetadata:
     kv_cache_layout: KVCacheLayout
@@ -683,6 +699,9 @@ class FlashInferMetadata:
     """
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
+
+    query_execution_plans: tuple["QueryExecutionPlan", ...] | None = None
+    msa_calls: tuple[FlashInferMSACall, ...] = ()
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -1157,6 +1176,205 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             ragged_q_lens, q_len_per_req, causal, self.device
         )
 
+    def _new_msa_wrapper(
+        self,
+    ) -> tuple[BatchPrefillWithPagedKVCacheWrapper, torch.Tensor]:
+        workspace = torch.empty_like(self._get_workspace_buffer())
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            workspace,
+            get_flashinfer_layout_string(self.kv_cache_layout),
+            backend="auto",
+        )
+        return wrapper, workspace
+
+    def _plan_msa_calls(
+        self, common: CommonAttentionMetadata
+    ) -> tuple[FlashInferMSACall, ...]:
+        plans = common.query_execution_plans
+        if common.num_reqs != 1 or plans is None or len(plans) != 1:
+            raise NotImplementedError("MSA planning requires exactly one request")
+        spec = self.kv_cache_spec
+        if (
+            type(spec) is not FullAttentionSpec
+            or spec.sliding_window is not None
+            or spec.attention_chunk_size is not None
+            or spec.non_causal
+            or spec.kv_quant_mode != KVQuantMode.NONE
+            or self.use_dcp
+            or self.enable_cuda_graph
+            or self.has_sinks
+            or self.window_left != -1
+            or not common.causal
+            or not self.global_hyperparameters.has_same_all_params
+            or self.head_dim != 128
+            or self.page_size != spec.block_size
+            or spec.head_size_v != self.head_dim
+            or self.kv_cache_dtype not in (torch.float16, torch.bfloat16)
+            or self.q_data_type_prefill != self.kv_cache_dtype
+            or self.model_config.dtype != self.kv_cache_dtype
+        ):
+            raise NotImplementedError("Unsupported MSA FlashInfer configuration")
+        if self.page_size not in (16, 32, 64):
+            raise NotImplementedError("MSA native FlashInfer requires 16/32/64 pages")
+        if self.num_qo_heads <= 0 or self.num_kv_heads <= 0:
+            raise ValueError("MSA attention head counts must be positive")
+        if self.num_qo_heads % self.num_kv_heads:
+            raise ValueError("MSA query heads must be divisible by KV heads")
+        plan = plans[0]
+        count = plan.packed_q_count
+        if (
+            not plan.msa_enabled
+            or count <= 0
+            or plan.logical_end - plan.logical_start != plan.logical_advance
+            or plan.logits_row != count - 1
+            or common.num_actual_tokens != count
+            or common.max_query_len != count
+        ):
+            raise ValueError("MSA packed query plan does not match the batch")
+        if (
+            common.query_start_loc_cpu.ndim != 1
+            or common.query_start_loc_cpu.shape[0] < 2
+            or common.query_start_loc_cpu.dtype not in (torch.int32, torch.int64)
+            or str(common.query_start_loc_cpu.device) != "cpu"
+            or common.query_start_loc_cpu[:2].tolist() != [0, count]
+            or common.query_start_loc.ndim != 1
+            or common.query_start_loc.shape[0] < 2
+            or common.query_start_loc.dtype not in (torch.int32, torch.int64)
+            or common.query_start_loc[:2].to(device="cpu").tolist() != [0, count]
+        ):
+            raise ValueError("MSA packed query boundaries mismatch")
+        if any(
+            tensor.device != self.device
+            for tensor in (
+                common.query_start_loc, common.seq_lens, common.slot_mapping,
+                common.block_table_tensor,
+            )
+        ):
+            raise ValueError("MSA metadata tensors must share the builder device")
+        if (
+            common.positions is None
+            or common.positions.ndim != 1
+            or common.positions.shape[0] < count
+            or common.positions.dtype not in (torch.int32, torch.int64)
+            or common.positions.device != self.device
+            or common.positions[:count].to(device="cpu").tolist()
+            != list(plan.logical_positions)
+        ):
+            raise ValueError("MSA positions must equal the planned logical positions")
+        if (
+            common.seq_lens.ndim != 1
+            or common.seq_lens.shape[0] < 1
+            or common.seq_lens.dtype not in (torch.int32, torch.int64)
+            or common.seq_lens[:1].to(device="cpu").tolist() != [plan.logical_end]
+        ):
+            raise ValueError("MSA sequence length must retain the logical endpoint")
+        seq_lens_cpu = common.seq_lens_cpu_upper_bound
+        if seq_lens_cpu is not None and (
+            seq_lens_cpu.ndim != 1
+            or seq_lens_cpu.shape[0] < 1
+            or seq_lens_cpu.dtype not in (torch.int32, torch.int64)
+            or str(seq_lens_cpu.device) != "cpu"
+            or seq_lens_cpu[:1].tolist() != [plan.logical_end]
+        ):
+            raise ValueError("MSA CPU sequence length disagrees with the endpoint")
+        if common.max_seq_len < plan.logical_end:
+            raise ValueError("MSA maximum sequence length is too short")
+
+        ranges = tuple(plan.query_ranges)
+        previous = plan.logical_start
+        for begin, end in ranges:
+            if not previous <= begin < end <= plan.logical_end:
+                raise ValueError("MSA query ranges must be ordered and non-overlapping")
+            previous = end
+        if (
+            not ranges
+            or ranges[-1][1] != plan.logical_end
+            or sum(end - begin for begin, end in ranges) != count
+        ):
+            raise ValueError("MSA query ranges do not cover the packed query")
+
+        num_pages = cdiv(plan.logical_end, self.page_size)
+        table = common.block_table_tensor
+        if (
+            table.ndim != 2
+            or table.shape[0] < 1
+            or table.shape[1] < num_pages
+            or table.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("MSA block table does not cover the logical sequence")
+        page_table = table[0, :num_pages].to(
+            device="cpu", dtype=torch.int32, copy=True
+        )
+        page_values = page_table.tolist()
+        if any(block_id <= 0 for block_id in page_values):
+            raise ValueError("MSA block table contains an uninstalled page")
+        if (
+            common.slot_mapping.ndim != 1
+            or common.slot_mapping.shape[0] < count
+            or common.slot_mapping.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("MSA slot mapping does not cover the packed query")
+        expected_slots = [
+            page_values[position // self.page_size] * self.page_size
+            + position % self.page_size
+            for position in plan.logical_positions
+        ]
+        if common.slot_mapping[:count].to(device="cpu").tolist() != expected_slots:
+            raise ValueError("MSA slots do not match the logical positions and pages")
+
+        calls = []
+        offset = 0
+        for begin, end in ranges:
+            pages = cdiv(end, self.page_size)
+            query_len = end - begin
+            page_ids_cpu = page_table[:pages].clone()
+            page_ids = page_ids_cpu.to(
+                device=self.device, dtype=torch.int32, copy=True
+            )
+            qo_indptr = torch.tensor([0, query_len], dtype=torch.int32, device="cpu")
+            kv_indptr = torch.tensor([0, pages], dtype=torch.int32, device="cpu")
+            last_page_len = torch.tensor(
+                [(end - 1) % self.page_size + 1], dtype=torch.int32, device="cpu"
+            )
+            seq_lens = torch.tensor([end], dtype=torch.int32, device="cpu")
+            wrapper, workspace = self._new_msa_wrapper()
+            wrapper.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_indptr,
+                paged_kv_indices=page_ids,
+                paged_kv_last_page_len=last_page_len,
+                seq_lens=seq_lens,
+                num_qo_heads=self.num_qo_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_dim,
+                page_size=self.page_size,
+                causal=True,
+                pos_encoding_mode="NONE",
+                sm_scale=self.sm_scale,
+                window_left=self.window_left,
+                logits_soft_cap=self.logits_soft_cap,
+                q_data_type=self.q_data_type_prefill,
+                kv_data_type=self.kv_cache_dtype,
+                o_data_type=self.model_config.dtype,
+                fixed_split_size=self.prefill_fixed_split_size,
+                disable_split_kv=self.disable_split_kv,
+                non_blocking=False,
+            )
+            calls.append(
+                FlashInferMSACall(
+                    wrapper=wrapper,
+                    q_slice=slice(offset, offset + query_len),
+                    kv_len=end,
+                    page_ids=page_ids,
+                    workspace=workspace,
+                    plan_buffers=(
+                        qo_indptr, kv_indptr, last_page_len, seq_lens, page_ids_cpu
+                    ),
+                )
+            )
+            offset += query_len
+        return tuple(calls)
+
     def _get_prefill_wrapper(
         self,
         causal: bool = True,
@@ -1330,6 +1548,33 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMetadata:
+        plans = getattr(common_attn_metadata, "query_execution_plans", None)
+        if plans and any(plan.msa_enabled for plan in plans):
+            if common_prefix_len != 0:
+                raise NotImplementedError("MSA cascade planning is not supported")
+            if fast_build or self.enable_cuda_graph:
+                raise NotImplementedError("MSA planning requires the eager build path")
+            calls = self._plan_msa_calls(common_attn_metadata)
+            count = common_attn_metadata.num_actual_tokens
+            return FlashInferMetadata(
+                kv_cache_layout=self.kv_cache_layout,
+                num_actual_tokens=count,
+                slot_mapping=common_attn_metadata.slot_mapping[:count].clone(),
+                q_data_type_prefill=self.q_data_type_prefill,
+                q_data_type_decode=self.q_data_type_decode,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_prefills=1,
+                num_prefill_tokens=count,
+                causal=True,
+                prefill=None,
+                decode=None,
+                use_cascade=False,
+                cascade_wrapper=None,
+                query_execution_plans=tuple(plans),
+                msa_calls=calls,
+            )
+
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
@@ -2044,6 +2289,11 @@ class FlashInferImpl(AttentionImpl):
         if attn_metadata is None:
             # Profiling run.
             return output.fill_(0)
+
+        if attn_metadata.msa_calls:
+            raise NotImplementedError(
+                "MSA metadata is prepared; attention execution requires layer 3"
+            )
 
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale
